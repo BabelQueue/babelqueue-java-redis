@@ -75,6 +75,34 @@ The envelope is unchanged (`schema_version` stays `1`); Redis is purely additive
 > consumer reading a queue produced by the Laravel driver must replicate Laravel's
 > reserve/ack semantics.
 
+## Trace propagation (OpenTelemetry `traceparent`, ADR-0028)
+
+Redis lists carry no native metadata channel, so to propagate a W3C `traceparent` (out of
+band, beside the frozen envelope — GR-1) the transport wraps the bare envelope in a small,
+transport-owned JSON frame distinct from the wire envelope:
+`{"__bq_frame":1,"headers":…,"body":<raw envelope>}` (the same `__bq_frame` Go and PHP
+use). The optional core `com.babelqueue.otel` module drives it:
+
+```java
+// produce: HeaderSender -> RedisPublisher.publishWithHeaders (frames only when headers exist)
+RedisPublisher publisher = RedisPublisher.create(redis, "orders");
+Tracing.publish(tracer, "urn:babel:orders:created", Map.of("order_id", 1042), "orders",
+    (envelope, headers) -> publisher.publishWithHeaders(envelope, headers));
+
+// consume: a header-aware handler receives the surfaced headers for wrapHandler's Supplier
+RedisConsumer.builder(redis, "orders")
+    .handler("urn:babel:orders:created", (env, body, headers) ->
+        Tracing.wrapHandler(tracer, h, () -> headers).handle(env))
+    .build();
+```
+
+A header-less `publish(...)` stores the bare envelope **byte-for-byte**; a bare
+(un-framed) value still consumes — the consumer detects a frame by the reserved
+`__bq_frame` sentinel (a frozen envelope never carries it), and the `LREM` ack handle
+stays the stored value, so cross-version queues interoperate. The existing
+`(env, body)` handler keeps working. Requires `babelqueue-core` ≥ 1.5.0; no new runtime
+dependency (the frame codec is self-contained, the seam is a plain `Map<String,String>`).
+
 ## Build & test
 
 ```bash

@@ -26,6 +26,13 @@ import java.util.function.BooleanSupplier;
  * unchanged — there is no broker-side reconciliation to apply (the §1 manifest block locks
  * only payload identity; attempts handling is runtime-specific).
  *
+ * <p>A reserved value carrying out-of-band headers (e.g. a W3C {@code traceparent},
+ * ADR-0028) is wrapped in a transport-owned {@link RedisFrame} ({@code __bq_frame}) JSON
+ * frame; the consumer unframes it transparently, decodes the bare envelope and surfaces the
+ * headers to a {@link HeaderHandler}. A bare (un-framed) value consumes exactly as before
+ * with empty headers, so cross-version queues interoperate. The {@code LREM} ack handle is
+ * always the stored value (frame or bare), so reservation accounting is unaffected.
+ *
  * <p>This is a Java-owned reliable queue; full parity with Laravel's reserved-sorted-set
  * reservation on a <em>shared</em> Redis queue is a separate task (broker-bindings §1.4).
  */
@@ -43,10 +50,36 @@ public final class RedisConsumer {
         void onUnknownUrn(Envelope envelope, String body);
     }
 
+    /**
+     * A header-aware handler: like {@link BabelHandler} but also receives the message's
+     * out-of-band transport headers (e.g. a carried {@code traceparent}; empty when none).
+     * It is the consume-side seam for the optional core
+     * {@code com.babelqueue.otel.Tracing#wrapHandler(io.opentelemetry.api.trace.Tracer,
+     * com.babelqueue.idempotency.Handler, java.util.function.Supplier)}:
+     *
+     * <pre>{@code
+     * RedisConsumer.builder(redis, "orders")
+     *     .handler(urn, (env, body, headers) -> Tracing
+     *         .wrapHandler(tracer, h, () -> headers)
+     *         .handle(env))
+     *     .build();
+     * }</pre>
+     */
+    @FunctionalInterface
+    public interface HeaderHandler {
+        void handle(Envelope envelope, String body, Map<String, String> headers) throws Exception;
+    }
+
+    /** Internal adapter so a {@link BabelHandler} and a {@link HeaderHandler} share one dispatch path. */
+    @FunctionalInterface
+    private interface Registered {
+        void handle(Envelope envelope, String body, Map<String, String> headers) throws Exception;
+    }
+
     private final RedisCommands<String, String> redis;
     private final String queue;
     private final String processing;
-    private final Map<String, BabelHandler> handlers;
+    private final Map<String, Registered> handlers;
     private final long blockTimeoutSeconds;
     private final ErrorHandler onError;
     private final UnknownUrnHandler onUnknownUrn;
@@ -70,11 +103,11 @@ public final class RedisConsumer {
      * ack it when handled. Returns the number of messages reserved this call (0 or 1).
      */
     public int poll() {
-        String body = redis.blmove(queue, processing, LMoveArgs.Builder.leftRight(), blockTimeoutSeconds);
-        if (body == null) {
+        String value = redis.blmove(queue, processing, LMoveArgs.Builder.leftRight(), blockTimeoutSeconds);
+        if (value == null) {
             return 0; // nothing arrived within the block timeout
         }
-        handle(body);
+        handle(value);
         return 1;
     }
 
@@ -90,7 +123,13 @@ public final class RedisConsumer {
         }
     }
 
-    private void handle(String body) {
+    private void handle(String value) {
+        // The reserved value may be a transport-owned header frame (ADR-0028) or a bare
+        // envelope. Unframe to recover the bare envelope body + out-of-band headers, but
+        // ack against the original reserved value — the LREM handle is the stored string.
+        RedisFrame.Unframed unframed = RedisFrame.unframe(value);
+        String body = unframed.body();
+        Map<String, String> headers = unframed.headers();
         Envelope envelope = EnvelopeCodec.decode(body);
 
         if (!EnvelopeCodec.accepts(envelope)) {
@@ -101,11 +140,11 @@ public final class RedisConsumer {
         }
 
         String urn = EnvelopeCodec.urn(envelope);
-        BabelHandler handler = handlers.get(urn);
+        Registered handler = handlers.get(urn);
         if (handler == null) {
             if (onUnknownUrn != null) {
                 onUnknownUrn.onUnknownUrn(envelope, body);
-                ack(body);
+                ack(value);
             } else {
                 // Leave it on the processing list for a recovery sweep.
                 report(new UnknownUrnException(urn), envelope, body);
@@ -114,17 +153,17 @@ public final class RedisConsumer {
         }
 
         try {
-            handler.handle(envelope, body);
-            ack(body);
+            handler.handle(envelope, body, headers);
+            ack(value);
         } catch (Exception error) {
             // Leave the message on the processing list — at-least-once; a sweep requeues it.
             report(error, envelope, body);
         }
     }
 
-    /** Remove one occurrence of the reserved body from the processing list (LREM). */
-    private void ack(String body) {
-        redis.lrem(processing, 1, body);
+    /** Remove one occurrence of the reserved value from the processing list (LREM). */
+    private void ack(String value) {
+        redis.lrem(processing, 1, value);
     }
 
     private void report(Throwable error, Envelope envelope, String body) {
@@ -147,7 +186,7 @@ public final class RedisConsumer {
     public static final class Builder {
         private final RedisCommands<String, String> redis;
         private final String queue;
-        private final Map<String, BabelHandler> handlers = new HashMap<>();
+        private final Map<String, Registered> handlers = new HashMap<>();
         private long blockTimeoutSeconds = 5;
         private ErrorHandler onError;
         private UnknownUrnHandler onUnknownUrn;
@@ -159,12 +198,22 @@ public final class RedisConsumer {
 
         /** Register {@code handler} for {@code urn} (the last registration wins). */
         public Builder handler(String urn, BabelHandler handler) {
-            this.handlers.put(urn, handler);
+            this.handlers.put(urn, (env, body, headers) -> handler.handle(env, body));
+            return this;
+        }
+
+        /**
+         * Register a header-aware {@code handler} for {@code urn} (the last registration
+         * wins) — it additionally receives the message's out-of-band transport headers,
+         * the seam for OpenTelemetry {@code traceparent} propagation (ADR-0028).
+         */
+        public Builder handler(String urn, HeaderHandler handler) {
+            this.handlers.put(urn, handler::handle);
             return this;
         }
 
         public Builder handlers(Map<String, BabelHandler> handlers) {
-            this.handlers.putAll(handlers);
+            handlers.forEach((urn, h) -> this.handlers.put(urn, (env, body, headers) -> h.handle(env, body)));
             return this;
         }
 

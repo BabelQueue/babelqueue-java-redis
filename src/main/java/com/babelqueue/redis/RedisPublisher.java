@@ -21,6 +21,12 @@ import java.util.Objects;
  * RedisPublisher publisher = RedisPublisher.create(redis, "orders");
  * String id = publisher.publish("urn:babel:orders:created", Map.of("order_id", 1042));
  * }</pre>
+ *
+ * <p>To carry an out-of-band header (e.g. a W3C {@code traceparent}, ADR-0028) beside the
+ * envelope — Redis having no native metadata channel — {@link #publishWithHeaders} wraps
+ * the bare envelope in a transport-owned {@link RedisFrame} ({@code __bq_frame}) JSON
+ * frame. A header-less publish still stores the bare envelope byte-for-byte, so the wire
+ * envelope is never touched (GR-1) and pre-frame consumers keep working.
  */
 public final class RedisPublisher {
 
@@ -50,6 +56,21 @@ public final class RedisPublisher {
     public String publish(String urn, Map<String, Object> data, String traceId) {
         Envelope envelope = EnvelopeCodec.make(urn, data, queue, traceId);
         redis.rpush(queue, EnvelopeCodec.encode(envelope));
+        return envelope.meta().id();
+    }
+
+    /**
+     * Publish an already-built {@code envelope} together with out-of-band transport
+     * {@code headers} (e.g. a W3C {@code traceparent}, ADR-0028). With usable headers it
+     * {@code RPUSH}es a transport-owned {@link RedisFrame} JSON frame
+     * ({@code {"__bq_frame":1,"headers":…,"body":<raw envelope>}}) wrapping the bare
+     * envelope; with no/empty/blank headers it {@code RPUSH}es the bare envelope
+     * byte-for-byte, byte-identical to {@link #publish}. The frozen envelope is never
+     * touched (GR-1). This is the produce-side seam the optional core
+     * {@code com.babelqueue.otel.HeaderSender} wires to. Returns {@code meta.id}.
+     */
+    public String publishWithHeaders(Envelope envelope, Map<String, String> headers) {
+        redis.rpush(queue, RedisFrame.frame(EnvelopeCodec.encode(envelope), headers));
         return envelope.meta().id();
     }
 
