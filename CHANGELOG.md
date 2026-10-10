@@ -7,7 +7,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
-## [Unreleased]
+## [1.1.0] - 2026-06-21
 
 ### Added
 - **OpenTelemetry `traceparent` transport wiring (ADR-0028, v0.2).** Redis lists have no
@@ -50,5 +50,5 @@ The envelope wire format is versioned separately by `meta.schema_version`
   full parity with Laravel's reserved-sorted-set reservation on a shared Redis queue is
   a separate task (broker-bindings §1.4).
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-java-redis/compare/v1.0.0...HEAD
+[1.1.0]: https://github.com/BabelQueue/babelqueue-java-redis/releases/tag/v1.1.0
 [1.0.0]: https://github.com/BabelQueue/babelqueue-java-redis/releases/tag/v1.0.0
