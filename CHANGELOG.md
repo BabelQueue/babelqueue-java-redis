@@ -16,7 +16,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
   both `cjson` calls of the reserve script (decode and re-encode) are `pcall`-guarded, so a body that
   cannot be decoded or re-encoded (e.g. `1e400`, `NaN`) takes the poison path (stored raw in
   `:reserved`, then dead-lettered) instead of failing the script after the pop. `RedisPublisher.publishDelayed` scores
-  `floor(now) + ceil(delay)`. Limit: no `__bq_frame` / `traceparent` in this layout (A3).
+  `floor(now) + ceil(delay)`. Limit: no `__bq_frame` / `traceparent` in this layout (ADR-0033 §5).
 - **Legacy `:processing` sweep.** `<q>:processing:deadlines` sorted set (member
   `<32-hex token>:<raw>`), a Lua sweep before every reserve, and ack/release/DLQ gated on the
   deadline removal (a late ack is a no-op). `retryAfterSeconds` (default 90) /
