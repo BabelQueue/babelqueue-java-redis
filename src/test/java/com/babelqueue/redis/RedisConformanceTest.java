@@ -1,15 +1,12 @@
 package com.babelqueue.redis;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
-import io.lettuce.core.LMoveArgs;
 import io.lettuce.core.api.sync.RedisCommands;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -49,7 +46,11 @@ class RedisConformanceTest {
 
     /** The body produced for the fixture is the canonical envelope, unwrapped — no extra fields. */
     @Test
-    void produceStoresTheCanonicalEnvelopeVerbatim() throws Exception {
+    void produceStoresTheCanonicalEnvelopeVerbatim() throws Throwable {
+        RedisConformanceResults.record("redis", "payload_identity", this::storesTheCanonicalEnvelopeVerbatim).execute();
+    }
+
+    private void storesTheCanonicalEnvelopeVerbatim() throws Exception {
         JSONObject identity = redisBlock().getJSONObject("payload_identity");
         String fixture = resource(identity.getString("envelope_file"));
         Envelope fixtureEnvelope = EnvelopeCodec.decode(fixture);
@@ -78,26 +79,34 @@ class RedisConformanceTest {
     }
 
     /**
-     * The fixture bytes round-trip through produce ({@code RPUSH}) → reserve ({@code BLMOVE})
+     * The fixture bytes round-trip through produce ({@code RPUSH}) → reserve (Lua)
      * unchanged: the consumer hands the handler the exact stored bytes, no mutation.
      */
     @Test
-    void produceThenReserveReturnsIdenticalBytes() throws Exception {
+    void produceThenReserveReturnsIdenticalBytes() throws Throwable {
+        RedisConformanceResults.record("redis", "payload_identity", this::reserveReturnsIdenticalBytes).execute();
+    }
+
+    private void reserveReturnsIdenticalBytes() throws Exception {
         String fixture = resource(redisBlock().getJSONObject("payload_identity").getString("envelope_file"));
         String canonical = EnvelopeCodec.encode(EnvelopeCodec.decode(fixture)); // the byte form this SDK stores
 
-        RedisCommands<String, String> redis = mockRedis();
-        // Reserve replays exactly what produce stored (a real Redis BLMOVE returns the element verbatim).
-        when(redis.blmove(eq(QUEUE), eq(QUEUE + ":processing"), any(LMoveArgs.class), anyLong()))
-            .thenReturn(canonical, (String) null);
+        // Reserve replays exactly what produce stored (a real Redis returns the element verbatim).
+        Reservation reservation = new Reservation(canonical, "0123456789abcdef0123456789abcdef", false);
+        RedisQueueOps ops = Mockito.mock(RedisQueueOps.class);
+        when(ops.layout()).thenReturn(RedisLayout.LEGACY);
+        when(ops.inFlightKey()).thenReturn(QUEUE + ":processing");
+        when(ops.reserve()).thenReturn(reservation, (Reservation) null);
 
         String[] delivered = {null};
-        RedisConsumer.builder(redis, QUEUE)
+        RedisConsumer.builder(mockRedis(), QUEUE)
+            .ops(ops)
             .handler(EnvelopeCodec.urn(EnvelopeCodec.decode(canonical)), (env, raw) -> delivered[0] = raw)
             .build()
             .poll();
 
         assertEquals(canonical, delivered[0], "reserve must return the stored envelope bytes unchanged");
-        verify(redis).lrem(QUEUE + ":processing", 1, canonical); // ack removes the exact bytes
+        verify(ops).ack(reservation); // ack targets the exact reserved bytes
+        assertEquals(canonical, reservation.body());
     }
 }

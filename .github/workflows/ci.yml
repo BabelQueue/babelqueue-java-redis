@@ -11,6 +11,21 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      BQ_REDIS_URL: redis://localhost:6379
+      # Fail (not skip) the live Redis conformance cases when Redis is unreachable.
+      BQ_REQUIRE_REDIS: "1"
+      BQ_CONFORMANCE_VERSION: 1.6.0
     strategy:
       fail-fast: false
       matrix:
@@ -24,23 +39,42 @@ jobs:
           java-version: ${{ matrix.java }}
           cache: maven
 
-      # `verify` runs the JUnit 5 suite (incl. the Redis binding conformance test)
-      # and the JaCoCo >=90% line-coverage gate. Tests mock the Redis command seam —
-      # no Redis, no network — so they run in the same job as the build.
+      # `verify` runs the JUnit 5 suite and the JaCoCo >=90% line-coverage gate. The unit
+      # tests mock the Redis command seam; the conformance suite's redis_layout behavioural
+      # cases (Lua scripts, :processing sweep, delayed window) run against the redis:7
+      # service container above, and BQ_REQUIRE_REDIS makes an unreachable Redis a failure.
       - name: Test
         run: mvn -B --no-transfer-progress verify
+        env:
+          # The conformance runner writes results.json (ADR-0032) when this is set.
+          BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # Schema-valid, no `fail` and no `skip` (BQ_REQUIRE_REDIS=1 above, so every behavioural case
+      # really ran against Redis), and every redis-scope section and case present.
+      - name: Validate results.json
+        run: |
+          python -m pip install --quiet jsonschema==4.23.0
+          python -I .github/scripts/check-conformance-results.py "$RUNNER_TEMP/results.json" \
+            src/test/resources/conformance "$BQ_CONFORMANCE_VERSION"
 
   conformance:
     name: Conformance suite in sync
     runs-on: ubuntu-latest
     env:
-      BQ_CONFORMANCE_VERSION: 1.5.0
+      BQ_CONFORMANCE_VERSION: 1.6.0
+      # Integrity pin for fetch.sh (sha256 of conformance/fetch.sh at the pinned tag).
+      BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849
     steps:
       - uses: actions/checkout@v5
       - name: Verify vendored conformance matches the pinned release asset
         run: |
           curl --fail --silent --show-error --location --output "$RUNNER_TEMP/fetch.sh" \
             "https://raw.githubusercontent.com/BabelQueue/conformance/v${BQ_CONFORMANCE_VERSION}/fetch.sh"
+          echo "${BQ_FETCH_SH_SHA256}  $RUNNER_TEMP/fetch.sh" | sha256sum -c -
           bash "$RUNNER_TEMP/fetch.sh" --check "$BQ_CONFORMANCE_VERSION" "src/test/resources/conformance"
 
   ci-green:

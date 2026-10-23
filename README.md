@@ -17,7 +17,7 @@ pattern.
 <dependency>
   <groupId>com.babelqueue</groupId>
   <artifactId>babelqueue-redis</artifactId>
-  <version>1.0.0</version>
+  <version>1.1.0</version>
 </dependency>
 ```
 
@@ -68,12 +68,45 @@ Retry is **at-least-once**: a throwing handler leaves the message on the
 it. The poll loop never stops on a bad message — observe via `onError` / `onUnknownUrn`.
 The envelope is unchanged (`schema_version` stays `1`); Redis is purely additive.
 
-> **Scope.** This is a **Java-owned reliable queue**, mirroring the Go runtime's
-> reliable-queue mechanism. Pointed at a queue this SDK owns end-to-end it is a complete,
-> crash-safe transport. **Full parity with Laravel's reserved-sorted-set reservation on a
-> _shared_ PHP+Java Redis queue is a separate task** (see broker-bindings §1.4): a
-> consumer reading a queue produced by the Laravel driver must replicate Laravel's
-> reserve/ack semantics.
+> **Scope.** The default (`RedisLayout.LEGACY`) is a **Java-owned reliable queue**,
+> mirroring the Go runtime's reliable-queue mechanism. For a queue **shared with the Laravel
+> driver** use the zset layout below.
+
+## Laravel-compatible layout (`RedisLayout.ZSET`, ADR-0033)
+
+```java
+RedisPublisher publisher = RedisPublisher.builder(redis, "orders")
+    .layout(RedisLayout.ZSET).build();                      // keys: queues:orders[:delayed|:reserved|:notify]
+publisher.publishDelayed("urn:babel:orders:created", Map.of("order_id", 1), 30);
+
+RedisConsumer consumer = RedisConsumer.builder(redis, "orders")
+    .layout(RedisLayout.ZSET)
+    .retryAfterSeconds(90)            // reservation lease; .retryAfterDisabled() turns recovery off
+    .migrationBatchSize(1000)         // optional cap per migrate pass (default: unbounded)
+    .handler("urn:babel:orders:created", (env, body) -> { /* ... */ })
+    .build();
+```
+
+- Reserve, release, migrate and dead-letter are each **one Lua script** (`EVALSHA`, with an
+  `EVAL` fallback on `NOSCRIPT`), so a crash can never lose or duplicate a message in transit.
+  Due `:delayed` members and expired `:reserved` members are migrated back to the ready list
+  before every reserve. A non-JSON member is dead-lettered instead of blocking the queue.
+- A delayed publish scores the member `floor(now) + ceil(delay)` (seconds).
+- A throwing handler leaves the reservation to expire and be recovered (at-least-once); with
+  `failureDelaySeconds(n)` the message is instead released to `:delayed` after `n` seconds with
+  `attempts + 1`.
+- **Limit (design A3):** the zset layout stores the bare envelope, so it carries **no**
+  `__bq_frame` / `traceparent` headers; trace propagation (below) works in the legacy layout only.
+  `trace_id` inside the envelope is still preserved (GR-4).
+
+### Legacy layout: crash recovery
+
+The legacy `<queue>:processing` list is paired with a `<queue>:processing:deadlines` sorted set
+(member `<32-hex token>:<raw envelope>`, score `floor(now) + retryAfter`). Before every reserve a
+Lua sweep requeues expired reservations byte-for-byte (`attempts` unchanged); ack, release and
+dead-letter are gated on removing the deadline member, so a **late ack after a sweep is a
+no-op** and never removes a redelivered copy. With `retryAfterDisabled()` a reservation has no
+deadline (`+inf`) and is never swept. Default `retryAfterSeconds` is 90.
 
 ## Trace propagation (OpenTelemetry `traceparent`, ADR-0028)
 
@@ -100,7 +133,7 @@ A header-less `publish(...)` stores the bare envelope **byte-for-byte**; a bare
 (un-framed) value still consumes — the consumer detects a frame by the reserved
 `__bq_frame` sentinel (a frozen envelope never carries it), and the `LREM` ack handle
 stays the stored value, so cross-version queues interoperate. The existing
-`(env, body)` handler keeps working. Requires `babelqueue-core` ≥ 1.5.0; no new runtime
+`(env, body)` handler keeps working. Requires `babelqueue-core` ≥ 1.5.0 (this release builds on 1.11.0); no new runtime
 dependency (the frame codec is self-contained, the seam is a plain `Map<String,String>`).
 
 ## Build & test
@@ -109,8 +142,12 @@ dependency (the frame codec is self-contained, the seam is a plain `Map<String,S
 mvn verify
 ```
 
-Unit tests mock the `RedisCommands` seam (no Redis, no network) and capture the
-`RPUSH`/`BLMOVE`/`LREM` calls with Mockito. JaCoCo gates the build at ≥90% line coverage.
+Unit tests mock the `RedisCommands` seam (no Redis, no network) with Mockito. The cross-SDK
+conformance suite's `redis_layout` / `redis_delay` behavioural cases (Lua scripts, sweep, delayed
+window) need a live Redis: set `BQ_REDIS_URL` (default `redis://localhost:6379`). Without Redis
+they are skipped; with `BQ_REQUIRE_REDIS=1` (as in CI, a `redis:7` service) an unreachable Redis
+fails the build. The pure cases (key names, the delayed-score formula) always run. JaCoCo gates
+the build at ≥90% line coverage.
 
 ## License
 

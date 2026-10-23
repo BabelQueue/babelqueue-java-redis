@@ -1,23 +1,26 @@
 /**
- * Redis transport for BabelQueue — a canonical-envelope {@link com.babelqueue.redis.RedisPublisher}
+ * Redis transport for BabelQueue &mdash; a canonical-envelope {@link com.babelqueue.redis.RedisPublisher}
  * and a URN-routed {@link com.babelqueue.redis.RedisConsumer} over the Lettuce client,
  * on the framework-agnostic {@code babelqueue-core}.
  *
- * <p>It implements §1 of the broker-bindings contract using the reliable-queue list
- * pattern: the canonical envelope JSON <em>is</em> the Redis list element, stored
- * byte-for-byte with no wrapping and no added metadata (Redis lists carry no native
- * attribute channel, so there is no property projection). Producing is {@code RPUSH};
- * reserving moves the head of the ready list to a per-queue {@code <queue>:processing}
- * list with {@code BLMOVE} (so an in-flight message survives a worker crash); acking
- * is {@code LREM} of that processing list. The envelope is unchanged
- * ({@code schema_version} stays 1); Redis is purely additive.
+ * <p>It implements &sect;1 of the broker-bindings contract in two layouts
+ * ({@link com.babelqueue.redis.RedisLayout}); the envelope is unchanged
+ * ({@code schema_version} stays 1) in both.
  *
- * <p>This is a <strong>Java-owned reliable queue</strong>: it mirrors the Go runtime's
- * reliable-queue mechanism. Full parity with Laravel's reserved-sorted-set reservation
- * on a <em>shared</em> PHP+Java Redis queue is a separate task — a consumer reading a
- * queue produced by the Laravel driver must replicate Laravel's reserve/ack semantics
- * (see broker-bindings §1.4). Pointed at a queue this SDK owns end-to-end, it is a
- * complete, crash-safe transport.
+ * <ul>
+ *   <li><strong>{@code LEGACY}</strong> (default) &mdash; the Java-owned reliable queue. The canonical envelope JSON
+ *       is the list element, stored byte-for-byte. Reserving atomically moves the head of {@code <queue>} to
+ *       {@code <queue>:processing} ({@code LMOVE}) and records a deadline in the sorted set
+ *       {@code <queue>:processing:deadlines}; acking removes both. Before every reserve a sweep returns reservations
+ *       whose deadline passed (a crashed worker's) to {@code <queue>}, body unchanged. The deadline is
+ *       {@code retry_after} seconds (default 90; {@code null} = never expires).</li>
+ *   <li><strong>{@code ZSET}</strong> &mdash; Laravel's Redis layout ({@code queues:<queue>}, {@code :delayed},
+ *       {@code :reserved}, {@code :notify}), driven by Lua scripts through {@code EVALSHA}, so a Java worker and a
+ *       Laravel worker can share one queue. Delayed publish and release use {@code :delayed}; an expired
+ *       {@code :reserved} entry is recovered with {@code attempts + 1}. This layout carries no
+ *       {@code __bq_frame} header frame, so out-of-band transport headers (W3C {@code traceparent}) are not carried
+ *       (the envelope's {@code trace_id} still is).</li>
+ * </ul>
  *
  * <p>Full spec: <a href="https://babelqueue.com">babelqueue.com</a>.
  */

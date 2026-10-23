@@ -3,15 +3,12 @@ package com.babelqueue.redis;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
-import io.lettuce.core.LMoveArgs;
 import io.lettuce.core.api.sync.RedisCommands;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
@@ -36,12 +33,27 @@ import org.mockito.Mockito;
 class RedisTraceparentTest {
 
     private static final String QUEUE = "orders";
-    private static final String PROCESSING = "orders:processing";
+    private static final String TOKEN = "0123456789abcdef0123456789abcdef";
     private static final String TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
 
     @SuppressWarnings("unchecked")
     private static RedisCommands<String, String> mockRedis() {
         return Mockito.mock(RedisCommands.class);
+    }
+
+    /** A legacy-layout {@link RedisQueueOps} double that hands out {@code reservations} then reports empty. */
+    private static RedisQueueOps opsReserving(Reservation... reservations) {
+        RedisQueueOps ops = Mockito.mock(RedisQueueOps.class);
+        when(ops.layout()).thenReturn(RedisLayout.LEGACY);
+        when(ops.inFlightKey()).thenReturn(QUEUE + ":processing");
+        Reservation[] rest = new Reservation[reservations.length];
+        System.arraycopy(reservations, 1, rest, 0, reservations.length - 1);
+        when(ops.reserve()).thenReturn(reservations[0], rest);
+        return ops;
+    }
+
+    private static RedisConsumer.Builder consumer(RedisQueueOps ops) {
+        return RedisConsumer.builder(mockRedis(), QUEUE).ops(ops);
     }
 
     @Test
@@ -79,12 +91,12 @@ class RedisTraceparentTest {
         RedisCommands<String, String> redis = mockRedis();
         Envelope env = EnvelopeCodec.make("urn:babel:orders:created", Map.of("x", 1), QUEUE, "trace-1");
         String frame = RedisFrame.frame(EnvelopeCodec.encode(env), Map.of("traceparent", TRACEPARENT));
-        when(redis.blmove(eq(QUEUE), eq(PROCESSING), any(LMoveArgs.class), anyLong()))
-            .thenReturn(frame, (String) null);
+        Reservation reservation = new Reservation(frame, TOKEN, false);
+        RedisQueueOps ops = opsReserving(reservation, null);
 
         Map<String, String>[] seenHeaders = new Map[]{null};
         String[] seenBody = {null};
-        RedisConsumer.builder(redis, QUEUE)
+        consumer(ops)
             .handler("urn:babel:orders:created", (e, body, headers) -> {
                 seenBody[0] = body;
                 seenHeaders[0] = headers;
@@ -94,25 +106,25 @@ class RedisTraceparentTest {
 
         assertEquals(EnvelopeCodec.encode(env), seenBody[0]);          // bare envelope to the handler
         assertEquals(TRACEPARENT, seenHeaders[0].get("traceparent"));  // headers surfaced
-        verify(redis).lrem(PROCESSING, 1, frame);                      // ack handle is the stored frame
+        verify(ops).ack(reservation);                                   // ack handle is the stored frame
+        assertEquals(frame, reservation.body());
     }
 
     @Test
     void bareValueConsumesWithEmptyHeadersBackCompat() {
-        RedisCommands<String, String> redis = mockRedis();
         Envelope env = EnvelopeCodec.make("urn:babel:orders:created", Map.of("x", 1), QUEUE, "trace-1");
         String bare = EnvelopeCodec.encode(env);
-        when(redis.blmove(eq(QUEUE), eq(PROCESSING), any(LMoveArgs.class), anyLong()))
-            .thenReturn(bare, (String) null);
+        Reservation reservation = new Reservation(bare, TOKEN, false);
+        RedisQueueOps ops = opsReserving(reservation, null);
 
         Map<String, String>[] seenHeaders = new Map[]{null};
-        RedisConsumer.builder(redis, QUEUE)
+        consumer(ops)
             .handler("urn:babel:orders:created", (e, body, headers) -> seenHeaders[0] = headers)
             .build()
             .poll();
 
         assertTrue(seenHeaders[0].isEmpty());
-        verify(redis).lrem(PROCESSING, 1, bare); // bare value is its own ack handle
+        verify(ops).ack(reservation); // the bare value is the reserved body
     }
 
     @Test
@@ -133,15 +145,14 @@ class RedisTraceparentTest {
             tracer, "urn:babel:orders:created", Map.of("order_id", 7), QUEUE,
             (envelope, headers) -> publisher.publishWithHeaders(envelope, headers));
 
-        // Feed the produced frame back through BLMOVE.
+        // Feed the produced frame back as the reservation.
         ArgumentCaptor<String> stored = ArgumentCaptor.forClass(String.class);
         verify(redis).rpush(eq(QUEUE), stored.capture());
-        when(redis.blmove(eq(QUEUE), eq(PROCESSING), any(LMoveArgs.class), anyLong()))
-            .thenReturn(stored.getValue(), (String) null);
+        RedisQueueOps ops = opsReserving(new Reservation(stored.getValue(), TOKEN, false), null);
 
         // Consumer: wrapHandler reads the surfaced frame headers and parents the CONSUMER span
         // on the carried traceparent.
-        RedisConsumer.builder(redis, QUEUE)
+        consumer(ops)
             .handler("urn:babel:orders:created", (env, body, headers) ->
                 com.babelqueue.otel.Tracing.wrapHandler(tracer, e -> { }, () -> headers).handle(env))
             .build()

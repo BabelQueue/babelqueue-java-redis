@@ -7,9 +7,10 @@ import com.babelqueue.Envelope;
 public interface BabelHandler {
 
     /**
-     * Handle a message. Returning normally acknowledges it (the consumer {@code LREM}s
-     * it from the processing list); throwing leaves it on the processing list for a
-     * recovery sweep to requeue (at-least-once).
+     * Handle a message. Returning normally acknowledges it (the consumer removes the
+     * reservation); throwing leaves it reserved until its {@code retry_after} deadline passes, after which the
+     * consumer-side sweep (legacy layout) or migrate (zset layout) returns it to the ready queue
+     * (at-least-once).
      *
      * @param envelope the decoded, validated envelope
      * @param body     the raw envelope JSON the message arrived as (byte-identical to what was produced)

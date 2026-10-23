@@ -7,6 +7,31 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+### Added
+- **Laravel-compatible zset layout (`RedisLayout.ZSET`, ADR-0033, conformance 1.6.0).** Keys
+  `queues:<q>`, `:delayed`, `:reserved`, `:notify`; reserve / release / migrate / dead-letter are
+  single Lua scripts run through `EVALSHA` with an `EVAL` fallback on `NOSCRIPT` (`LuaExecutor`);
+  both `cjson` calls of the reserve script (decode and re-encode) are `pcall`-guarded, so a body that
+  cannot be decoded or re-encoded (e.g. `1e400`, `NaN`) takes the poison path (stored raw in
+  `:reserved`, then dead-lettered) instead of failing the script after the pop. `RedisPublisher.publishDelayed` scores
+  `floor(now) + ceil(delay)`. Limit: no `__bq_frame` / `traceparent` in this layout (A3).
+- **Legacy `:processing` sweep.** `<q>:processing:deadlines` sorted set (member
+  `<32-hex token>:<raw>`), a Lua sweep before every reserve, and ack/release/DLQ gated on the
+  deadline removal (a late ack is a no-op). `retryAfterSeconds` (default 90) /
+  `retryAfterDisabled()` / `migrationBatchSize` on the consumer builder.
+- Conformance runner for the `redis_layout` and `redis_delay` sections (pure cases always run;
+  behavioural cases run against a live Redis, `BQ_REQUIRE_REDIS` turns an unreachable Redis into a
+  failure). CI and release run against a `redis:7` service container. The runner writes a
+  `results.json` (ADR-0032) when `BQ_CONFORMANCE_RESULTS` is set, which CI validates.
+
+### Changed
+- Depends on `babelqueue-core` 1.11.0 (was 1.5.0). The envelope is unchanged (`schema_version: 1`).
+- In the default `LEGACY` layout a non-conformant envelope (valid JSON that fails `EnvelopeCodec.accepts`) is
+  now dead-lettered to `<queue>.dlq` (raw body, no `dead_letter` block). Before, it was left in
+  `<queue>:processing`; with the new deadline sweep it would have been redelivered forever.
+
 ## [1.1.0] - 2026-06-21
 
 ### Added
