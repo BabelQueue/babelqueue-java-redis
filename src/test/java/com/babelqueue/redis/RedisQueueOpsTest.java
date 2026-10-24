@@ -248,6 +248,101 @@ class RedisQueueOpsTest {
         assertEquals(2, legacy(rec).deliveryCount(new Reservation(stored, "tok", false)));
     }
 
+    // ------------------------------------------------------------------ byte-exact (invalid UTF-8)
+
+    /** {@code {"a":"} + 0xFF + {@code "}}: well-formed JSON text around one byte that is not UTF-8. */
+    private static final byte[] BAD = {'{', '"', 'a', '"', ':', '"', (byte) 0xFF, '"', '}'};
+
+    @Test
+    void zsetReserveKeepsTheExactBytesOfAPoisonThatIsNotUtf8() {
+        RecordingRedis rec = new RecordingRedis().script(RedisLua.ZSET_RESERVE, List.of(BAD, BAD));
+        Reservation r = zset(rec).reserve();
+        assertTrue(r.poison());
+        assertTrue(r.hasInvalidUtf8());
+        assertArrayEquals(BAD, r.bodyBytes());
+        assertArrayEquals(BAD, r.handleBytes());
+        assertArrayEquals(BAD, r.exactBody());
+    }
+
+    @Test
+    void zsetAckOfANonUtf8ReservationRemovesTheExactMemberBytes() {
+        RecordingRedis rec = new RecordingRedis().script(RedisLua.ZSET_RESERVE, List.of(BAD, BAD)).zrem(1L);
+        RedisQueueOps ops = zset(rec);
+        Reservation r = ops.reserve();
+        assertTrue(ops.ack(r));
+        RecordingRedis.ByteCall zrem = rec.byteCalls.stream().filter(c -> c.method().equals("zrem")).findFirst().get();
+        assertArrayEquals(BAD, zrem.values().get(0));
+    }
+
+    @Test
+    void zsetDeadLetterOfANonUtf8ReservationUsesTheExactBytesForTheMemberAndTheRecord() {
+        RecordingRedis rec = new RecordingRedis().script(RedisLua.ZSET_RESERVE, List.of(BAD, BAD))
+            .script(RedisLua.ZSET_DEAD_LETTER, 1L);
+        RedisQueueOps ops = zset(rec);
+        Reservation r = ops.reserve();
+        byte[] record = "{\"raw\":\"/w==\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        assertTrue(ops.deadLetter(r, new String(record, java.nio.charset.StandardCharsets.UTF_8)));
+        RecordingRedis.ByteCall call = rec.byteCalls.stream()
+            .filter(c -> c.method().startsWith("eval")).reduce((a, b) -> b).get();
+        assertArrayEquals(BAD, call.values().get(0));
+        assertArrayEquals(record, call.values().get(1));
+        assertTrue(ops.deadLetter(r));
+        RecordingRedis.ByteCall raw = rec.byteCalls.stream()
+            .filter(c -> c.method().startsWith("eval")).reduce((a, b) -> b).get();
+        assertArrayEquals(BAD, raw.values().get(1));
+    }
+
+    @Test
+    void legacyReserveKeepsTheExactBytesOfABodyThatIsNotUtf8() {
+        RecordingRedis rec = new RecordingRedis()
+            .script(RedisLua.LEGACY_SWEEP, 0L)
+            .script(RedisLua.LEGACY_RESERVE, BAD);
+        Reservation r = legacy(rec).reserve();
+        assertFalse(r.poison());
+        assertTrue(r.hasInvalidUtf8());
+        assertArrayEquals(BAD, r.bodyBytes());
+        byte[] member = r.exactLegacyMember();
+        byte[] expected = new byte[33 + BAD.length];
+        System.arraycopy((r.handle() + ":").getBytes(java.nio.charset.StandardCharsets.UTF_8), 0, expected, 0, 33);
+        System.arraycopy(BAD, 0, expected, 33, BAD.length);
+        assertArrayEquals(expected, member);
+    }
+
+    @Test
+    void legacyAckAndDeadLetterOfANonUtf8BodyUseTheExactBytes() {
+        RecordingRedis rec = new RecordingRedis()
+            .script(RedisLua.LEGACY_SWEEP, 0L)
+            .script(RedisLua.LEGACY_RESERVE, BAD)
+            .script(RedisLua.LEGACY_ACK, 1L)
+            .script(RedisLua.LEGACY_MOVE, 1L);
+        RedisQueueOps ops = legacy(rec);
+        Reservation r = ops.reserve();
+        assertTrue(ops.ack(r));
+        RecordingRedis.ByteCall ack = rec.byteCalls.stream()
+            .filter(c -> c.method().startsWith("eval") && c.values().size() == 2).reduce((a, b) -> b).get();
+        assertArrayEquals(r.exactLegacyMember(), ack.values().get(0));
+        assertArrayEquals(BAD, ack.values().get(1));
+
+        assertTrue(ops.deadLetter(r));
+        RecordingRedis.ByteCall move = rec.byteCalls.stream()
+            .filter(c -> c.method().startsWith("eval") && c.values().size() == 3).reduce((a, b) -> b).get();
+        assertArrayEquals(r.exactLegacyMember(), move.values().get(0));
+        assertArrayEquals(BAD, move.values().get(1));
+        assertArrayEquals(BAD, move.values().get(2));
+    }
+
+    @Test
+    void validUtf8ReservationsCarryNoByteCopyAndSettleOnTheTextPath() {
+        RecordingRedis rec = new RecordingRedis().script(RedisLua.ZSET_RESERVE, List.of(BODY, BODY)).zrem(1L);
+        RedisQueueOps ops = zset(rec);
+        Reservation r = ops.reserve();
+        assertFalse(r.hasInvalidUtf8());
+        assertNull(r.bodyBytes());
+        assertNull(r.handleBytes());
+        assertTrue(ops.ack(r));
+        assertTrue(rec.byteCalls.stream().noneMatch(c -> c.method().equals("zrem")), "valid UTF-8 acks via zrem()");
+    }
+
     // ------------------------------------------------------------------------------------- ack
 
     @Test

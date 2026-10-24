@@ -44,6 +44,9 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `<queue>:processing`; with the new deadline sweep it would have been redelivered forever.
 
 ### Fixed
+- **Invalid UTF-8 is poison in both Redis layouts (broker-bindings section 1.1).** A stored value (or zset `:reserved` member) that is not valid UTF-8 is dead-lettered on first delivery as the ADR-0035 `raw`/`raw_encoding: "base64"` wrapper, even when the codec or `cjson` could decode it: it is never handed to a handler and never retried, released or re-published, and the exact stored bytes are used for the settle script, so no byte is rewritten.
+- The Redis poison dead-letter element is now the ADR-0035 record (raw splice, or the `raw`/`raw_encoding` wrapper) carrying a `dead_letter` block, instead of the bare element (broker-bindings section 1). Uses a local `PoisonRecord` copy (KEEP IN SYNC with `babelqueue-core`) until the dependency is bumped.
+- **Poison and non-UTF-8 values are read as bytes.** Reserve runs through a `ByteArrayCodec` Lettuce dispatch, so a stored body that is not valid UTF-8 reaches the ADR-0035 record as the base64 wrapper instead of carrying U+FFFD, and ack / release / dead-letter (including the zset `ZREM` member) send the exact stored bytes back. Valid UTF-8 values keep the text path; the public `RedisCommands<String, String>` API is unchanged.
 - **A URN with no handler and no `onUnknownUrn` hook is now dead-lettered instead of redelivered forever.**
   It used to be reported to `onError` and left reserved, so it came back after `retry_after` (or, in the zset
   layout, after the reservation expired) and looped. It now gets the `onError` callback (if any) and an

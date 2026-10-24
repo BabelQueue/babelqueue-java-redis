@@ -1,5 +1,6 @@
 package com.babelqueue.redis;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -18,6 +19,7 @@ import static org.mockito.Mockito.when;
 import com.babelqueue.BabelQueueException;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
+import com.babelqueue.JsonValues;
 import com.babelqueue.UnknownUrnException;
 import io.lettuce.core.api.sync.RedisCommands;
 import java.util.AbstractMap;
@@ -126,7 +128,10 @@ class RedisConsumerTest {
         Throwable[] captured = {null};
         builder().onError((err, env, body) -> captured[0] = err).build().poll();
         assertInstanceOf(BabelQueueException.class, captured[0]);
-        verify(ops).deadLetter(r);
+        // The frame-looking value is a non-envelope object on the zset layout: spliced verbatim, not unwrapped.
+        Map<?, ?> record = poisonRecordOf(r);
+        assertTrue(record.containsKey("__bq_frame"));
+        assertEquals("poison", deadLetterBlock(record).get("reason"));
     }
 
     @Test
@@ -398,8 +403,86 @@ class RedisConsumerTest {
         builder().onError((err, env, body) -> captured[0] = err).build().poll();
 
         assertInstanceOf(BabelQueueException.class, captured[0]);
-        verify(ops).deadLetter(r);
         verify(ops, never()).ack(any());
+
+        // ADR-0035: the original object plus the additive dead_letter block, spliced after the original members.
+        ArgumentCaptor<String> written = ArgumentCaptor.forClass(String.class);
+        verify(ops).deadLetter(eq(r), written.capture());
+        assertTrue(written.getValue().startsWith("{\"not\":\"an envelope\",\"dead_letter\":{"), written.getValue());
+        Map<?, ?> record = (Map<?, ?>) JsonValues.decode(written.getValue());
+        assertEquals("an envelope", record.get("not"));
+        Map<?, ?> block = deadLetterBlock(record);
+        assertEquals("poison", block.get("reason"));
+        assertEquals(QUEUE, block.get("original_queue"));
+        assertEquals(0, ((Number) block.get("attempts")).intValue());
+        assertEquals("java", block.get("lang"));
+    }
+
+    @Test
+    void framedNonConformantValueIsDeadLetteredUnwrappedInTheAdrShape() {
+        String framed = RedisFrame.frame("{\"not\":\"an envelope\"}", Map.of("traceparent", "x"));
+        Reservation r = new Reservation(framed, framed, false);
+        when(ops.reserve()).thenReturn(r);
+
+        builder().build().poll();
+
+        Map<?, ?> record = poisonRecordOf(r);
+        assertEquals("an envelope", record.get("not"));
+        assertFalse(record.containsKey("__bq_frame"), "the DLQ element is the ADR record, not a header frame");
+        assertEquals("poison", deadLetterBlock(record).get("reason"));
+    }
+
+    @Test
+    void nonObjectPoisonIsDeadLetteredInTheRawWrapper() {
+        when(ops.layout()).thenReturn(RedisLayout.ZSET);
+        Reservation r = new Reservation("not json", "not json", true);
+        when(ops.reserve()).thenReturn(r);
+
+        builder().build().poll();
+
+        Map<?, ?> record = poisonRecordOf(r);
+        assertEquals("not json", record.get("raw"));
+        assertFalse(record.containsKey("raw_encoding"));
+        Map<?, ?> block = deadLetterBlock(record);
+        assertEquals("poison", block.get("reason"));
+        assertEquals(QUEUE, block.get("original_queue"));
+    }
+
+    @Test
+    void nonUtf8PoisonIsDeadLetteredAsABase64WrapperWithoutReplacementCharacters() {
+        for (RedisLayout layout : RedisLayout.values()) {
+            RedisQueueOps layoutOps = Mockito.mock(RedisQueueOps.class);
+            when(layoutOps.layout()).thenReturn(layout);
+            when(layoutOps.inFlightKey()).thenReturn("orders:processing");
+            byte[] bad = {'{', '"', 'a', '"', ':', '"', (byte) 0xFF, '"', '}'};
+            String lossy = new String(bad, java.nio.charset.StandardCharsets.UTF_8); // contains U+FFFD
+            Reservation r = new Reservation(lossy, lossy, layout == RedisLayout.ZSET, bad, layout == RedisLayout.ZSET ? bad : null);
+            when(layoutOps.reserve()).thenReturn(r);
+
+            RedisConsumer.builder(mockRedis(), QUEUE).ops(layoutOps).build().poll();
+
+            ArgumentCaptor<String> written = ArgumentCaptor.forClass(String.class);
+            verify(layoutOps).deadLetter(eq(r), written.capture());
+            assertFalse(written.getValue().contains("\uFFFD"), "no U+FFFD substitution (ADR-0035): " + layout);
+            Map<?, ?> record = (Map<?, ?>) JsonValues.decode(written.getValue());
+            assertEquals("base64", record.get("raw_encoding"), layout.toString());
+            assertEquals(java.util.Base64.getEncoder().encodeToString(bad), record.get("raw"));
+            assertArrayEquals(bad, java.util.Base64.getDecoder().decode((String) record.get("raw")));
+            Map<?, ?> block = deadLetterBlock(record);
+            assertEquals("poison", block.get("reason"));
+            assertEquals(QUEUE, block.get("original_queue"));
+            verify(layoutOps, never()).ack(any());
+        }
+    }
+
+    private Map<?, ?> poisonRecordOf(Reservation r) {
+        ArgumentCaptor<String> written = ArgumentCaptor.forClass(String.class);
+        verify(ops).deadLetter(eq(r), written.capture());
+        return (Map<?, ?>) JsonValues.decode(written.getValue());
+    }
+
+    private static Map<?, ?> deadLetterBlock(Map<?, ?> record) {
+        return (Map<?, ?>) record.get("dead_letter");
     }
 
     @Test
@@ -418,7 +501,46 @@ class RedisConsumerTest {
 
         assertInstanceOf(BabelQueueException.class, captured[0]);
         assertTrue(!handled[0]);
-        verify(ops).deadLetter(r);
+        Map<?, ?> record = poisonRecordOf(r);
+        assertEquals("not json", record.get("raw"));
+        assertEquals("poison", deadLetterBlock(record).get("reason"));
+    }
+
+    /** A conformant, decodable envelope whose data carries one 0xFF byte (not valid UTF-8). */
+    private static byte[] badUtf8Envelope() {
+        Envelope base = EnvelopeCodec.make(URN, Map.of("note", "XX"), QUEUE, null);
+        String text = EnvelopeCodec.encode(base);
+        byte[] bytes = text.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        bytes[text.indexOf("XX")] = (byte) 0xFF;
+        return bytes;
+    }
+
+    @Test
+    void aDecodableEnvelopeWithInvalidUtf8IsPoisonNeverDeliveredAndDeadLetteredInTheBase64Wrapper() {
+        for (RedisLayout layout : RedisLayout.values()) {
+            Mockito.reset(ops);
+            when(ops.layout()).thenReturn(layout);
+            byte[] stored = badUtf8Envelope();
+            // The text view is lossy (U+FFFD) and would decode as a valid envelope: the byte copy marks it poison.
+            Reservation r = new Reservation(new String(stored, java.nio.charset.StandardCharsets.UTF_8),
+                layout == RedisLayout.ZSET ? "reserved-member" : "0123456789abcdef0123456789abcdef",
+                false, stored, null);
+            when(ops.reserve()).thenReturn(r);
+
+            boolean[] called = {false};
+            builder().handler(URN, (env, raw) -> called[0] = true).build().poll();
+
+            assertFalse(called[0], layout.toString());
+            verify(ops, never()).ack(any());
+            verify(ops, never()).release(any(), anyDouble());
+            verify(ops, never()).releaseAt(any(), anyDouble(), anyDouble());
+            ArgumentCaptor<String> record = ArgumentCaptor.forClass(String.class);
+            verify(ops).deadLetter(eq(r), record.capture());
+            Map<?, ?> decoded = (Map<?, ?>) JsonValues.decode(record.getValue());
+            assertEquals("base64", decoded.get("raw_encoding"), layout.toString());
+            assertArrayEquals(stored, java.util.Base64.getDecoder().decode((String) decoded.get("raw")), layout.toString());
+            assertEquals("poison", deadLetterBlock(decoded).get("reason"));
+        }
     }
 
     @Test

@@ -4,7 +4,10 @@ import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import io.lettuce.core.ScriptOutputType;
 import io.lettuce.core.api.sync.RedisCommands;
+import io.lettuce.core.protocol.CommandType;
+import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.function.DoubleSupplier;
@@ -129,7 +132,9 @@ class RedisQueueOps {
 
     private Reservation reserveZset(double now) {
         migrateAt(now);
-        List<Object> reply = lua.run(
+        // Read as raw bytes: a stored value that is not valid UTF-8 must reach the poison DLQ record intact
+        // (ADR-0035 section 1), which a text-decoded reply would already have replaced with U+FFFD.
+        List<Object> reply = lua.runBytes(
             RedisLua.ZSET_RESERVE,
             ScriptOutputType.MULTI,
             new String[] {keys.ready(), keys.reserved(), keys.notifyKey()},
@@ -137,21 +142,38 @@ class RedisQueueOps {
         if (reply == null || reply.size() < 2 || reply.get(0) == null || reply.get(1) == null) {
             return null;
         }
-        String job = reply.get(0).toString();
-        String reserved = reply.get(1).toString();
-        return new Reservation(job, reserved, job.equals(reserved));
+        byte[] job = toBytes(reply.get(0));
+        byte[] reserved = toBytes(reply.get(1));
+        String jobText = Reservation.exactText(job);
+        String reservedText = Reservation.exactText(reserved);
+        return new Reservation(
+            jobText != null ? jobText : new String(job, StandardCharsets.UTF_8),
+            reservedText != null ? reservedText : new String(reserved, StandardCharsets.UTF_8),
+            Arrays.equals(job, reserved),
+            jobText != null ? null : job,
+            reservedText != null ? null : reserved);
+    }
+
+    private static byte[] toBytes(Object reply) {
+        return reply instanceof byte[] bytes ? bytes : reply.toString().getBytes(StandardCharsets.UTF_8);
     }
 
     private Reservation reserveLegacy(double now) {
         sweepAt(now);
         String token = newToken();
-        String raw = lua.run(
+        byte[] raw = lua.runBytes(
             RedisLua.LEGACY_RESERVE,
             ScriptOutputType.VALUE,
             new String[] {queue, RedisQueues.processing(queue), RedisQueues.deadlines(queue)},
             deadlineArg(now),
             token);
-        return raw == null ? null : new Reservation(raw, token, false);
+        if (raw == null) {
+            return null;
+        }
+        String text = Reservation.exactText(raw);
+        return text != null
+            ? new Reservation(text, token, false)
+            : new Reservation(new String(raw, StandardCharsets.UTF_8), token, false, raw, null);
     }
 
     /** A fresh 128-bit reservation token: 32 lowercase hex digits from {@link SecureRandom}. */
@@ -221,15 +243,24 @@ class RedisQueueOps {
     /** Acknowledge: remove the reservation. Legacy returns {@code false} (and warns) when it already expired. */
     boolean ack(Reservation reservation) {
         if (layout == RedisLayout.ZSET) {
-            Long removed = redis.zrem(keys.reserved(), reservation.handle());
+            Long removed = reservation.handleBytes() != null
+                ? lua.runBytesCommand(CommandType.ZREM, keys.reserved(), reservation.handleBytes())
+                : redis.zrem(keys.reserved(), reservation.handle());
             return removed != null && removed > 0;
         }
-        Long done = lua.run(
-            RedisLua.LEGACY_ACK,
-            ScriptOutputType.INTEGER,
-            new String[] {RedisQueues.processing(queue), RedisQueues.deadlines(queue)},
-            reservation.legacyMember(),
-            reservation.body());
+        Long done = reservation.hasInvalidUtf8()
+            ? lua.runBytes(
+                RedisLua.LEGACY_ACK,
+                ScriptOutputType.INTEGER,
+                new String[] {RedisQueues.processing(queue), RedisQueues.deadlines(queue)},
+                reservation.exactLegacyMember(),
+                reservation.exactBody())
+            : lua.run(
+                RedisLua.LEGACY_ACK,
+                ScriptOutputType.INTEGER,
+                new String[] {RedisQueues.processing(queue), RedisQueues.deadlines(queue)},
+                reservation.legacyMember(),
+                reservation.body());
         return gate(done, "ack");
     }
 
@@ -246,7 +277,7 @@ class RedisQueueOps {
             throw new IllegalArgumentException("delay must not be negative, got " + delay);
         }
         if (layout == RedisLayout.ZSET) {
-            if (reservation.poison()) {
+            if (reservation.poison() || reservation.hasInvalidUtf8() || reservation.handleBytes() != null) {
                 throw new IllegalStateException("a poison reservation cannot be released; dead-letter it");
             }
             lua.run(
@@ -262,6 +293,18 @@ class RedisQueueOps {
             throw new UnsupportedOperationException(
                 "a delayed release needs the zset layout; the legacy layout only releases immediately");
         }
+        if (reservation.hasInvalidUtf8()) {
+            // Not valid UTF-8, so never an envelope: re-queue the exact stored bytes, nothing to re-encode.
+            Long moved = lua.runBytes(
+                RedisLua.LEGACY_MOVE,
+                ScriptOutputType.INTEGER,
+                new String[] {RedisQueues.processing(queue), RedisQueues.deadlines(queue), queue},
+                reservation.exactLegacyMember(),
+                reservation.exactBody(),
+                reservation.exactBody());
+            gate(moved, "release");
+            return;
+        }
         RedisFrame.Unframed unframed = RedisFrame.unframe(reservation.body());
         String body = RedisFrame.frame(releaseBody(unframed.body()), unframed.headers());
         Long done = lua.run(
@@ -276,6 +319,9 @@ class RedisQueueOps {
 
     /** Move the reserved message to {@code <queue>.dlq} (raw body, byte-for-byte) and remove the reservation. */
     boolean deadLetter(Reservation reservation) {
+        if (reservation.hasInvalidUtf8()) {
+            return deadLetterBytes(reservation, reservation.bodyBytes());
+        }
         return deadLetter(reservation, reservation.body());
     }
 
@@ -286,6 +332,10 @@ class RedisQueueOps {
      * stored {@link Reservation#body()}.
      */
     boolean deadLetter(Reservation reservation, String dlqBody) {
+        if (reservation.hasInvalidUtf8() || reservation.handleBytes() != null) {
+            // The reservation is identified by bytes that are not valid UTF-8: send them exactly as stored.
+            return deadLetterBytes(reservation, dlqBody.getBytes(StandardCharsets.UTF_8));
+        }
         if (layout == RedisLayout.ZSET) {
             Long done = lua.run(
                 RedisLua.ZSET_DEAD_LETTER,
@@ -301,6 +351,26 @@ class RedisQueueOps {
             new String[] {RedisQueues.processing(queue), RedisQueues.deadlines(queue), RedisQueues.dlq(queue)},
             reservation.legacyMember(),
             reservation.body(),
+            dlqBody);
+        return gate(done, "dead-letter");
+    }
+
+    private boolean deadLetterBytes(Reservation reservation, byte[] dlqBody) {
+        if (layout == RedisLayout.ZSET) {
+            Long done = lua.runBytes(
+                RedisLua.ZSET_DEAD_LETTER,
+                ScriptOutputType.INTEGER,
+                new String[] {keys.reserved(), RedisQueues.dlq(queue)},
+                reservation.exactHandle(),
+                dlqBody);
+            return done != null && done == 1;
+        }
+        Long done = lua.runBytes(
+            RedisLua.LEGACY_MOVE,
+            ScriptOutputType.INTEGER,
+            new String[] {RedisQueues.processing(queue), RedisQueues.deadlines(queue), RedisQueues.dlq(queue)},
+            reservation.exactLegacyMember(),
+            reservation.exactBody(),
             dlqBody);
         return gate(done, "dead-letter");
     }

@@ -4,9 +4,11 @@ import com.babelqueue.BabelQueueException;
 import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
+import com.babelqueue.JsonValues;
 import com.babelqueue.UnknownUrnException;
 import io.lettuce.core.RedisCommandInterruptedException;
 import io.lettuce.core.api.sync.RedisCommands;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -208,23 +210,24 @@ public final class RedisConsumer {
         boolean zset = ops.layout() == RedisLayout.ZSET;
         // Legacy: the stored value may be a transport-owned header frame (ADR-0028) or a bare envelope.
         // Zset: Laravel's layout has no frame (A3) - the value is the job as stored.
-        RedisFrame.Unframed unframed = zset
+        // A stored value that is not valid UTF-8 is never an envelope and carries no readable frame: keep it as stored.
+        RedisFrame.Unframed unframed = zset || reservation.hasInvalidUtf8()
             ? new RedisFrame.Unframed(reservation.body(), Map.of())
             : RedisFrame.unframe(reservation.body());
         String body = unframed.body();
         Map<String, String> headers = unframed.headers();
         Envelope envelope = EnvelopeCodec.decode(body);
 
-        if (reservation.poison()) {
+        if (reservation.poison() || reservation.hasInvalidUtf8()) {
             report(new BabelQueueException("Dead-lettered a Redis job the reserve script could not decode."),
                 envelope, body);
-            ops.deadLetter(reservation);
+            ops.deadLetter(reservation, poisonRecord(reservation, body));
             return;
         }
         if (!EnvelopeCodec.accepts(envelope)) {
             report(new BabelQueueException("Rejected a non-conformant BabelQueue envelope from Redis."),
                 envelope, body);
-            ops.deadLetter(reservation);
+            ops.deadLetter(reservation, poisonRecord(reservation, body));
             return;
         }
         if (zset) {
@@ -285,6 +288,35 @@ public final class RedisConsumer {
             String encoded = EnvelopeCodec.encode(dead);
             return zset ? encoded : RedisFrame.frame(encoded, headers);
         } catch (RuntimeException e) {
+            return reservation.body();
+        }
+    }
+
+    /**
+     * The DLQ record of a poison value (ADR-0035): the original bytes with the additive {@code dead_letter} block
+     * ({@code reason: poison}, {@code original_queue}, {@code attempts}, {@code lang}) spliced in when the value is
+     * a strict JSON object, else a {@code {"raw":...,"dead_letter":...}} wrapper (base64 + {@code raw_encoding}
+     * when the bytes are not valid UTF-8). The record is the ADR shape itself, so a legacy header frame is
+     * unwrapped (the poison value is the frame's {@code body}) and not re-applied. If the record cannot be built
+     * the stored value is dead-lettered unchanged, so the message is never lost.
+     */
+    String poisonRecord(Reservation reservation, String body) {
+        try {
+            Map<String, Object> block = new java.util.LinkedHashMap<>();
+            block.put("reason", "poison");
+            block.put("error", "Redis value is not a conformant BabelQueue envelope.");
+            block.put("exception", BabelQueueException.class.getName());
+            block.put("failed_at", System.currentTimeMillis());
+            block.put("original_queue", queue);
+            block.put("attempts", 0);
+            block.put("lang", EnvelopeCodec.SOURCE_LANG);
+            // Exact stored bytes when they are not valid UTF-8 (the text view is lossy), else the (unframed) body.
+            byte[] raw = reservation.hasInvalidUtf8() ? reservation.bodyBytes() : body.getBytes(StandardCharsets.UTF_8);
+            return PoisonRecord.build(raw, JsonValues.encode(block));
+        } catch (RuntimeException e) {
+            if (reservation.hasInvalidUtf8()) {
+                throw e; // the text view is lossy: leave the reservation to be recovered rather than rewrite its bytes
+            }
             return reservation.body();
         }
     }
