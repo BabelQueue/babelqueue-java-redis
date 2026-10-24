@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-24
+
 ### Added
 - **Laravel-compatible zset layout (`RedisLayout.ZSET`, ADR-0033, conformance 1.6.0).** Keys
   `queues:<q>`, `:delayed`, `:reserved`, `:notify`; reserve / release / migrate / dead-letter are
@@ -38,7 +40,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
   neither configured the reservation is left alone and the message is redelivered after `retry_after`, as in
   the `LEGACY` layout (ADR-0034 §9, .NET `Leave` parity). This module has no max-attempts, so a permanently
   failing message is redelivered indefinitely; configure a backoff and bound retries on the Laravel side.
-- Depends on `babelqueue-core` 1.11.0 (was 1.5.0). The envelope is unchanged (`schema_version: 1`).
+- Depends on `babelqueue-core` 1.13.0 (was 1.5.0). The envelope is unchanged (`schema_version: 1`).
 - In the default `LEGACY` layout a non-conformant envelope (valid JSON that fails `EnvelopeCodec.accepts`) is
   now dead-lettered to `<queue>.dlq` (raw body, no `dead_letter` block). Before, it was left in
   `<queue>:processing`; with the new deadline sweep it would have been redelivered forever.
