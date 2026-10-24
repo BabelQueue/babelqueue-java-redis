@@ -217,6 +217,172 @@ class RedisConsumerTest {
         verify(ops, never()).ack(any());
     }
 
+    // ---- zset handler failure: delay = failureDelaySeconds > retry backoff > leave reservation ----------------------
+
+    private Reservation zsetReservation(int storedAttempts) {
+        when(ops.layout()).thenReturn(RedisLayout.ZSET);
+        Reservation r = new Reservation(envelope(storedAttempts), "m", false);
+        when(ops.reserve()).thenReturn(r);
+        return r;
+    }
+
+    private static BabelHandler boom() {
+        return (e, b) -> { throw new IllegalStateException("boom"); };
+    }
+
+    @Test
+    void zsetThrowingHandlerWithoutPolicyLeavesTheReservationUntilRetryAfter() {
+        zsetReservation(0);
+
+        builder().handler(URN, boom()).build().poll();
+
+        verify(ops, never()).release(any(), Mockito.anyDouble());
+        verify(ops, never()).ack(any());
+    }
+
+    @Test
+    void zeroScalarBackoffBaseCountsAsNoPolicyAndLeavesTheReservation() {
+        zsetReservation(0);
+
+        builder().retryBackoff(0.0).retryBackoffMultiplier(2.0).handler(URN, boom()).build().poll();
+
+        verify(ops, never()).release(any(), Mockito.anyDouble());
+    }
+
+    @Test
+    void explicitZeroFailureDelayReleasesImmediately() {
+        Reservation r = zsetReservation(0);
+
+        builder().failureDelaySeconds(0).handler(URN, boom()).build().poll();
+
+        verify(ops).release(r, 0.0);
+    }
+
+    @Test
+    void infiniteOrHugePolicyDelayIsClampedToTheCeiling() {
+        for (double huge : new double[] {Double.POSITIVE_INFINITY, Double.MAX_VALUE, 1e19}) {
+            setUp();
+            Reservation r = zsetReservation(0);
+            builder().retryBackoff((int n) -> huge).handler(URN, boom()).build().poll();
+            verify(ops).release(r, RedisConsumer.MAX_FAILURE_DELAY_SECONDS);
+        }
+    }
+
+    @Test
+    void hugeFailureDelayIsClampedToTheCeiling() {
+        Reservation r = zsetReservation(0);
+
+        builder().failureDelaySeconds(1e19).handler(URN, boom()).build().poll();
+
+        verify(ops).release(r, RedisConsumer.MAX_FAILURE_DELAY_SECONDS);
+    }
+
+    @Test
+    void zsetThrowingHandlerUsesTheRetryBackoffPolicyByDeliveryNumber() {
+        // stored attempts 2 -> the handler sees attempts 3 -> n = 3
+        Reservation r = zsetReservation(2);
+        List<Integer> seen = new ArrayList<>();
+
+        builder()
+            .retryBackoff((int n) -> {
+                seen.add(n);
+                return 10.0 * n;
+            })
+            .handler(URN, boom())
+            .build()
+            .poll();
+
+        assertEquals(List.of(3), seen);
+        verify(ops).release(r, 30.0);
+    }
+
+    @Test
+    void explicitFailureDelayWinsOverTheRetryBackoffPolicy() {
+        Reservation r = zsetReservation(0);
+
+        builder()
+            .failureDelaySeconds(5)
+            .retryBackoff((int n) -> 99.0)
+            .handler(URN, boom())
+            .build()
+            .poll();
+
+        verify(ops).release(r, 5.0);
+    }
+
+    @Test
+    void invalidPolicyResultCountsAsZeroDelay() {
+        Reservation r = zsetReservation(0);
+
+        builder().retryBackoff((int n) -> Double.NaN).handler(URN, boom()).build().poll();
+
+        verify(ops).release(r, 0.0);
+    }
+
+    @Test
+    void scalarBackoffKnobsGrowExponentiallyAndCapAtTheMax() {
+        for (int stored = 0; stored < 4; stored++) {
+            setUp();
+            Reservation r = zsetReservation(stored);
+            builder()
+                .retryBackoff(2.0)
+                .retryBackoffMultiplier(3.0)
+                .retryBackoffMax(20.0)
+                .handler(URN, boom())
+                .build()
+                .poll();
+            // n = 1..4 -> 2, 6, 18, min(54, 20)
+            verify(ops).release(r, new double[] {2.0, 6.0, 18.0, 20.0}[stored]);
+        }
+    }
+
+    @Test
+    void fullJitterScalesTheDelayByTheRandomSource() {
+        Reservation r = zsetReservation(1); // n = 2 -> d = 4 * 2 = 8
+
+        builder()
+            .retryBackoff(4.0)
+            .retryBackoffMultiplier(2.0)
+            .retryJitter(" Full ")
+            .randomSource(() -> 0.25)
+            .handler(URN, boom())
+            .build()
+            .poll();
+
+        verify(ops).release(r, 2.0);
+    }
+
+    @Test
+    void customPolicyOverridesTheScalarKnobs() {
+        Reservation r = zsetReservation(0);
+
+        builder().retryBackoff(100.0).retryBackoff((int n) -> 7.0).handler(URN, boom()).build().poll();
+
+        verify(ops).release(r, 7.0);
+    }
+
+    @Test
+    void legacyThrowingHandlerIgnoresRetryBackoffAndLeavesTheReservation() {
+        Reservation r = legacy(envelope(0));
+        when(ops.reserve()).thenReturn(r);
+
+        builder().retryBackoff(30.0).handler(URN, boom()).build().poll();
+
+        verify(ops, never()).release(any(), anyDouble());
+        verify(ops, never()).ack(any());
+    }
+
+    @Test
+    void retryBackoffBuilderValidation() {
+        assertThrows(IllegalArgumentException.class, () -> RedisConsumer.builder(mockRedis(), QUEUE).retryBackoff(-1.0));
+        assertThrows(IllegalArgumentException.class, () -> RedisConsumer.builder(mockRedis(), QUEUE).retryBackoff(Double.NaN));
+        assertThrows(IllegalArgumentException.class, () -> RedisConsumer.builder(mockRedis(), QUEUE).retryBackoffMultiplier(0.5));
+        assertThrows(IllegalArgumentException.class, () -> RedisConsumer.builder(mockRedis(), QUEUE).retryBackoffMax(-1.0));
+        assertThrows(IllegalArgumentException.class, () -> RedisConsumer.builder(mockRedis(), QUEUE).retryJitter("equal"));
+        assertThrows(NullPointerException.class,
+            () -> RedisConsumer.builder(mockRedis(), QUEUE).retryBackoff((java.util.function.IntToDoubleFunction) null));
+    }
+
     @Test
     void nonConformantEnvelopeReportsOnErrorAndIsDeadLettered() {
         Reservation r = legacy("{\"not\":\"an envelope\"}");
@@ -356,5 +522,7 @@ class RedisConsumerTest {
     @Test
     void failureDelayMustNotBeNegative() {
         assertThrows(IllegalArgumentException.class, () -> builder().failureDelaySeconds(-1));
+        assertThrows(IllegalArgumentException.class, () -> builder().failureDelaySeconds(Double.NaN));
+        assertThrows(IllegalArgumentException.class, () -> builder().failureDelaySeconds(Double.POSITIVE_INFINITY));
     }
 }

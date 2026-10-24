@@ -11,6 +11,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
 import java.util.function.DoubleSupplier;
+import java.util.function.IntToDoubleFunction;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 
@@ -37,9 +38,21 @@ import java.util.function.LongSupplier;
  * </ul>
  *
  * <p>The poll loop never stops on a bad message &mdash; observe via {@code onError}/{@code onUnknownUrn}.
- * A non-conformant envelope is reported and moved to {@code <queue>.dlq}; a throwing handler leaves the
- * reservation to expire and be recovered (at-least-once), unless {@code failureDelaySeconds} is set on a
- * zset-layout consumer, in which case the message is released to {@code :delayed} after that delay.
+ * A non-conformant envelope is reported and moved to {@code <queue>.dlq}.
+ *
+ * <p>A throwing handler is reported, then:
+ * <ul>
+ *   <li><b>zset layout</b> &mdash; the message is released to {@code :delayed} with {@code attempts + 1}
+ *       (A2) once a delay source is configured. The delay is, in order of precedence: the explicit {@code failureDelaySeconds} (a constant);
+ *       else the retry backoff {@code d(n) = min(max, base * multiplier^(n-1))} with {@code n} the 1-based
+ *       delivery number the handler saw (ADR-0034 section 9, see {@code retryBackoff*}). When neither is
+ *       configured the reservation is left alone and the message is redelivered once {@code retry_after}
+ *       expires, exactly as in the legacy layout (ADR-0034 section 9; .NET {@code Leave} parity) &mdash;
+ *       this module has no max-attempts, so there is no hot redelivery loop by default. A resulting delay
+ *       is capped at {@link #MAX_FAILURE_DELAY_SECONDS}.</li>
+ *   <li><b>legacy layout</b> &mdash; the reservation is left to expire and be recovered after
+ *       {@code retry_after} (at-least-once); no backoff or failure delay applies.</li>
+ * </ul>
  *
  * <p>A legacy reserved value carrying out-of-band headers (e.g. a W3C {@code traceparent}, ADR-0028) is
  * wrapped in a transport-owned {@link RedisFrame}; the consumer unframes it transparently and surfaces
@@ -87,6 +100,12 @@ public final class RedisConsumer {
         void handle(Envelope envelope, String body, Map<String, String> headers) throws Exception;
     }
 
+    /**
+     * Upper bound on a zset failure delay, in seconds (30 days). A larger or infinite delay (a "park it"
+     * policy) is clamped here so the {@code :delayed} score can never overflow into an instant redelivery.
+     */
+    public static final double MAX_FAILURE_DELAY_SECONDS = 30d * 24 * 3600;
+
     private static final long BACKOFF_START_MS = 100;
     private static final long BACKOFF_CAP_MS = 1000;
 
@@ -95,6 +114,7 @@ public final class RedisConsumer {
     private final Map<String, Registered> handlers;
     private final long blockTimeoutSeconds;
     private final Double failureDelaySeconds;
+    private final IntToDoubleFunction retryDelay;
     private final ErrorHandler onError;
     private final UnknownUrnHandler onUnknownUrn;
     private final LongSupplier nanoClock;
@@ -116,6 +136,7 @@ public final class RedisConsumer {
         this.handlers = Map.copyOf(builder.handlers);
         this.blockTimeoutSeconds = builder.blockTimeoutSeconds;
         this.failureDelaySeconds = builder.failureDelaySeconds;
+        this.retryDelay = builder.resolveRetryDelay();
         this.onError = builder.onError;
         this.onUnknownUrn = builder.onUnknownUrn;
         this.nanoClock = builder.nanoClock;
@@ -225,13 +246,41 @@ public final class RedisConsumer {
             handler.handle(envelope, body, headers);
         } catch (Exception error) {
             report(error, envelope, body);
-            if (zset && failureDelaySeconds != null) {
-                ops.release(reservation, failureDelaySeconds);
+            if (zset) {
+                Double delay = failureDelay(envelope);
+                if (delay != null) {
+                    ops.release(reservation, delay);
+                }
+                // else: no failureDelaySeconds / backoff configured -> leave the reservation, recovered after retry_after.
             }
-            // Otherwise leave the reservation: at-least-once, recovered after retry_after.
+            // Legacy: leave the reservation, at-least-once, recovered after retry_after.
             return;
         }
         ops.ack(reservation);
+    }
+
+    /**
+     * Zset failure delay in seconds: the explicit {@code failureDelaySeconds} wins; else the backoff for
+     * {@code n} = the delivery number the handler saw ({@code envelope.attempts()} is already stored + 1);
+     * else {@code null} (nothing configured: the caller leaves the reservation to expire). A {@code NaN} or
+     * negative policy result counts as 0; {@code +Infinity} or anything above
+     * {@link #MAX_FAILURE_DELAY_SECONDS} is clamped to it.
+     */
+    private Double failureDelay(Envelope envelope) {
+        if (failureDelaySeconds != null) {
+            return clampDelay(failureDelaySeconds);
+        }
+        if (retryDelay == null) {
+            return null;
+        }
+        return clampDelay(retryDelay.applyAsDouble(Math.max(envelope.attempts(), 1)));
+    }
+
+    private static double clampDelay(double delay) {
+        if (Double.isNaN(delay) || delay < 0) {
+            return 0.0;
+        }
+        return Math.min(delay, MAX_FAILURE_DELAY_SECONDS);
     }
 
     private void report(Throwable error, Envelope envelope, String body) {
@@ -264,6 +313,12 @@ public final class RedisConsumer {
         private Long retryAfterSeconds = RedisQueueOps.DEFAULT_RETRY_AFTER_SECONDS;
         private long migrationBatchSize = -1;
         private Double failureDelaySeconds;
+        private IntToDoubleFunction retryPolicy;
+        private double retryBackoffSeconds;
+        private double retryBackoffMultiplier = 1.0;
+        private double retryBackoffMaxSeconds;
+        private boolean retryJitterFull;
+        private DoubleSupplier random = () -> java.util.concurrent.ThreadLocalRandom.current().nextDouble();
         private ErrorHandler onError;
         private UnknownUrnHandler onUnknownUrn;
         private RedisQueueOps ops;
@@ -352,15 +407,106 @@ public final class RedisConsumer {
         }
 
         /**
-         * Zset layout: when a handler throws, release the message to {@code :delayed} after
-         * {@code seconds} (with {@code attempts + 1}) instead of leaving it for recovery. Unset by default.
+         * Zset layout: when a handler throws, release the message to {@code :delayed} after a constant
+         * {@code seconds} (with {@code attempts + 1}). Unset by default; when set it takes precedence over
+         * every {@code retryBackoff*} setting. When neither is set the reservation is left to expire and the
+         * message is redelivered after {@code retry_after}. Must be finite and {@code >= 0}; values above
+         * {@link RedisConsumer#MAX_FAILURE_DELAY_SECONDS} are clamped to it.
          */
         public Builder failureDelaySeconds(double seconds) {
-            if (seconds < 0) {
-                throw new IllegalArgumentException("failureDelaySeconds must not be negative");
+            if (!(seconds >= 0) || Double.isInfinite(seconds)) {
+                throw new IllegalArgumentException("failureDelaySeconds must be a finite number >= 0");
             }
             this.failureDelaySeconds = seconds;
             return this;
+        }
+
+        /**
+         * Zset layout: a custom retry backoff policy, {@code delayForAttempt(n)} = seconds to wait before
+         * redelivery, with {@code n} the 1-based delivery number that just failed. It is shaped to take the
+         * core {@code RetryBackoff} (ADR-0034 section 9) as {@code policy::delaySeconds}; this module's core
+         * pin (1.11.0) predates that class, so the type itself is not referenced here. Overrides the
+         * {@code retryBackoff*} scalar knobs; an explicit {@link #failureDelaySeconds} still wins over both.
+         */
+        public Builder retryBackoff(IntToDoubleFunction delayForAttempt) {
+            this.retryPolicy = Objects.requireNonNull(delayForAttempt, "delayForAttempt");
+            return this;
+        }
+
+        /**
+         * A9 {@code retry_backoff}: the base delay in seconds; zset layout only. Unset (or {@code 0}) the
+         * scalar backoff is off and a failing message keeps its reservation until {@code retry_after};
+         * a positive base turns the backoff on (use {@link #failureDelaySeconds} {@code (0)} to release
+         * immediately).
+         */
+        public Builder retryBackoff(double seconds) {
+            if (!(seconds >= 0) || Double.isInfinite(seconds)) {
+                throw new IllegalArgumentException("retry_backoff must be a finite number >= 0");
+            }
+            this.retryBackoffSeconds = seconds;
+            return this;
+        }
+
+        /** A9 {@code retry_backoff_multiplier} (default {@code 1}, must be {@code >= 1}). */
+        public Builder retryBackoffMultiplier(double multiplier) {
+            if (!(multiplier >= 1) || Double.isInfinite(multiplier)) {
+                throw new IllegalArgumentException("retry_backoff_multiplier must be a finite number >= 1");
+            }
+            this.retryBackoffMultiplier = multiplier;
+            return this;
+        }
+
+        /** A9 {@code retry_backoff_max} in seconds (default {@code 0} = unlimited). */
+        public Builder retryBackoffMax(double seconds) {
+            if (!(seconds >= 0) || Double.isInfinite(seconds)) {
+                throw new IllegalArgumentException("retry_backoff_max must be a finite number >= 0");
+            }
+            this.retryBackoffMaxSeconds = seconds;
+            return this;
+        }
+
+        /** A9 {@code retry_jitter}: {@code "none"} (default) or {@code "full"} ({@code uniform(0, d(n))}). */
+        public Builder retryJitter(String jitter) {
+            Objects.requireNonNull(jitter, "jitter");
+            // Same normalisation as the core RetryBackoff.Jitter.parse (strip + case-insensitive).
+            switch (jitter.strip().toLowerCase(java.util.Locale.ROOT)) {
+                case "none" -> this.retryJitterFull = false;
+                case "full" -> this.retryJitterFull = true;
+                default -> throw new IllegalArgumentException("retry_jitter must be 'none' or 'full', got: " + jitter);
+            }
+            return this;
+        }
+
+        /** Test seam: the uniform [0,1) source used by full jitter. */
+        Builder randomSource(DoubleSupplier source) {
+            this.random = Objects.requireNonNull(source, "source");
+            return this;
+        }
+
+        /** The policy in force: the custom one, else the scalar knobs' formula, else none (reservation left). */
+        private IntToDoubleFunction resolveRetryDelay() {
+            if (retryPolicy != null) {
+                return retryPolicy;
+            }
+            if (retryBackoffSeconds == 0) {
+                // No backoff configured (also skips pow(): 0 * Infinity would be NaN for a huge n).
+                return null;
+            }
+            double base = retryBackoffSeconds;
+            double multiplier = retryBackoffMultiplier;
+            double max = retryBackoffMaxSeconds;
+            boolean full = retryJitterFull;
+            DoubleSupplier source = random;
+            return n -> {
+                double d = base * Math.pow(multiplier, Math.max(n, 1) - 1);
+                if (Double.isNaN(d) || Double.isInfinite(d)) {
+                    d = max > 0 ? max : Double.MAX_VALUE;
+                }
+                if (max > 0 && d > max) {
+                    d = max;
+                }
+                return full ? d * source.getAsDouble() : d;
+            };
         }
 
         public Builder onError(ErrorHandler handler) {

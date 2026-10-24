@@ -26,7 +26,18 @@ The envelope wire format is versioned separately by `meta.schema_version`
   failure). CI and release run against a `redis:7` service container. The runner writes a
   `results.json` (ADR-0032) when `BQ_CONFORMANCE_RESULTS` is set, which CI validates.
 
+- **Zset handler-failure retry backoff (ADR-0034 §9).** `RedisConsumer.Builder` gains
+  `retryBackoff(double)`, `retryBackoffMultiplier`, `retryBackoffMax`, `retryJitter("none"|"full")` and a
+  pluggable `retryBackoff(IntToDoubleFunction)` policy: `d(n) = min(max, base * multiplier^(n-1))`, `n` the
+  1-based delivery number. Delays are capped at `RedisConsumer.MAX_FAILURE_DELAY_SECONDS` (30 days);
+  `failureDelaySeconds` now rejects `NaN`/infinite values.
+
 ### Changed
+- **Zset layout: a throwing handler is released to `:delayed` (`attempts + 1`) when `failureDelaySeconds` or a
+  retry backoff is configured**, with that delay (explicit `failureDelaySeconds` wins over the backoff). With
+  neither configured the reservation is left alone and the message is redelivered after `retry_after`, as in
+  the `LEGACY` layout (ADR-0034 §9, .NET `Leave` parity). This module has no max-attempts, so a permanently
+  failing message is redelivered indefinitely; configure a backoff and bound retries on the Laravel side.
 - Depends on `babelqueue-core` 1.11.0 (was 1.5.0). The envelope is unchanged (`schema_version: 1`).
 - In the default `LEGACY` layout a non-conformant envelope (valid JSON that fails `EnvelopeCodec.accepts`) is
   now dead-lettered to `<queue>.dlq` (raw body, no `dead_letter` block). Before, it was left in

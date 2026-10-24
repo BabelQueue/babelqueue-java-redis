@@ -63,9 +63,9 @@ bindings — there is **no property projection**. The single cross-SDK invariant
 **payload identity**: the stored element is the exact envelope bytes, with no outer
 job-structure and no added fields.
 
-Retry is **at-least-once**: a throwing handler leaves the message on the
+Retry is **at-least-once**: in the default layout a throwing handler leaves the message on the
 `<queue>:processing` list (a recovery sweep can requeue it); a successful handler `LREM`s
-it. The poll loop never stops on a bad message — observe via `onError` / `onUnknownUrn`.
+it (the zset layout releases it with a backoff when one is configured, see below). The poll loop never stops on a bad message — observe via `onError` / `onUnknownUrn`.
 The envelope is unchanged (`schema_version` stays `1`); Redis is purely additive.
 
 > **Scope.** The default (`RedisLayout.LEGACY`) is a **Java-owned reliable queue**,
@@ -92,9 +92,36 @@ RedisConsumer consumer = RedisConsumer.builder(redis, "orders")
   Due `:delayed` members and expired `:reserved` members are migrated back to the ready list
   before every reserve. A non-JSON member is dead-lettered instead of blocking the queue.
 - A delayed publish scores the member `floor(now) + ceil(delay)` (seconds).
-- A throwing handler leaves the reservation to expire and be recovered (at-least-once); with
-  `failureDelaySeconds(n)` the message is instead released to `:delayed` after `n` seconds with
-  `attempts + 1`.
+- A throwing handler is **released** to `:delayed` with `attempts + 1` (design A2) as soon as a delay
+  source is configured. The delay is, in order of precedence:
+  1. `failureDelaySeconds(n)` &mdash; a constant `n` seconds (an explicit value always wins);
+  2. the retry backoff (ADR-0034 §9), `d(k) = min(max, base * multiplier^(k-1))` with `k` the 1-based
+     delivery number (the `attempts` the handler saw): `retryBackoff(base)`,
+     `retryBackoffMultiplier(m >= 1)`, `retryBackoffMax(max)` (`0` = unlimited) and
+     `retryJitter("none" | "full")` (`full` = `uniform(0, d(k))`); or a custom policy,
+     `retryBackoff(IntToDoubleFunction)` (overrides the scalar knobs; shaped so the core
+     `RetryBackoff::delaySeconds` plugs in once the pinned core carries it);
+  3. otherwise nothing is released: the reservation is **left alone** and the message is redelivered
+     once `retry_after` expires (default 90 s), exactly like the legacy layout (ADR-0034 §9; .NET
+     `Leave` parity). A scalar `retryBackoff(0)` base counts as "not set"; use `failureDelaySeconds(0)`
+     to release immediately.
+
+  This module has no max-attempts / DLQ-after-N, so a message whose handler always fails is
+  redelivered indefinitely: set a backoff (or a delay) and bound the retries on the producer/Laravel
+  side (`--tries`). A delay is capped at `RedisConsumer.MAX_FAILURE_DELAY_SECONDS` (30 days);
+  `failureDelaySeconds` rejects `NaN`/infinite values and a policy returning `+Infinity` is clamped to
+  that cap (a negative or `NaN` policy result counts as 0).
+
+  ```java
+  RedisConsumer.builder(redis, "orders")
+      .layout(RedisLayout.ZSET)
+      .retryBackoff(2).retryBackoffMultiplier(2).retryBackoffMax(60).retryJitter("full")
+      .handler("urn:babel:orders:created", (envelope, body) -> process(envelope))
+      .build();
+  ```
+
+  The `LEGACY` layout is unchanged: a throwing handler leaves the reservation to expire and be
+  recovered after `retry_after`; the backoff settings do not apply there.
 - **Limit (design A3):** the zset layout stores the bare envelope, so it carries **no**
   `__bq_frame` / `traceparent` headers; trace propagation (below) works in the legacy layout only.
   `trace_id` inside the envelope is still preserved (GR-4).

@@ -149,11 +149,16 @@ final class RedisConformanceResults {
     // ---- file ---------------------------------------------------------------------------------
 
     private static void writeFile() {
+        writeTo(Path.of(System.getenv(ENV_RESULTS)), RECORDED);
+    }
+
+    /** Writes the results document for {@code recorded} to {@code target}; package-private so a test can exercise it. */
+    static void writeTo(Path target, Map<String, Map<String, String[]>> recorded) {
         try {
             JSONObject manifest = new JSONObject(resource("/conformance/manifest.json"));
             JSONObject sections = new JSONObject(new java.util.LinkedHashMap<String, Object>());
             for (Map.Entry<String, List<String>> section : expectedCases(manifest).entrySet()) {
-                Map<String, String[]> have = RECORDED.getOrDefault(section.getKey(), Map.of());
+                Map<String, String[]> have = recorded.getOrDefault(section.getKey(), Map.of());
                 JSONObject cases = new JSONObject(new java.util.LinkedHashMap<String, Object>());
                 for (String id : section.getValue()) {
                     String[] outcome = have.get(id);
@@ -176,7 +181,7 @@ final class RedisConformanceResults {
             doc.put("generated_at", Instant.now().truncatedTo(ChronoUnit.SECONDS).toString());
             doc.put("bindings", new JSONArray(List.of(BINDING)));
             doc.put("sections", sections);
-            Files.writeString(Path.of(System.getenv(ENV_RESULTS)), doc.toString(2) + "\n", StandardCharsets.UTF_8);
+            Files.writeString(target, doc.toString(2) + "\n", StandardCharsets.UTF_8);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
