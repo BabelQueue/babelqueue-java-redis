@@ -49,10 +49,6 @@ jobs:
           # The conformance runner writes results.json (ADR-0032) when this is set.
           BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
 
-      - name: TMP coverage dump
-        if: always()
-        run: awk -F, 'NR>1 {printf "%s %d/%d\n", $2"."$3, $9, $8+$9}' target/site/jacoco/jacoco.csv | sort
-
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
