@@ -431,7 +431,11 @@ class RedisLayoutConformanceTest {
         RedisQueueOps dying = new RedisQueueOps(redis, queue, RedisLayout.LEGACY, null, 1L, -1, RedisQueueOpsClock.WALL);
         RedisQueueOps noDeadline = new RedisQueueOps(redis, stuck, RedisLayout.LEGACY, null, null, -1, RedisQueueOpsClock.WALL);
         try {
-            String raw = "{\"job\": \"" + URN + "\",  \"attempts\": 2, \"data\": {\"id\": 1}}";
+            // A conformant envelope (the consumer rejects one without trace_id / meta as poison) with
+            // deliberately non-canonical spacing, so a re-encode would be caught by the byte comparison.
+            String raw = "{\"job\": \"" + URN + "\",  \"trace_id\": \"t-1\", \"attempts\": 2, \"data\": {\"id\": 1},"
+                + " \"meta\": {\"id\": \"f1e2d3c4-b5a6-4789-90ab-cdef01234567\", \"queue\": \"orders\","
+                + " \"lang\": \"php\", \"schema_version\": 1, \"created_at\": 1749132727000}}";
             redis.rpush(queue, raw);
             redis.rpush(stuck, raw);
             assertEquals(raw, dying.reserve().body());
