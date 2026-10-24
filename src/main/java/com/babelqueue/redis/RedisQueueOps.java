@@ -276,13 +276,23 @@ class RedisQueueOps {
 
     /** Move the reserved message to {@code <queue>.dlq} (raw body, byte-for-byte) and remove the reservation. */
     boolean deadLetter(Reservation reservation) {
+        return deadLetter(reservation, reservation.body());
+    }
+
+    /**
+     * Move the reserved message to {@code <queue>.dlq} writing {@code dlqBody} (e.g. an envelope annotated with
+     * a {@code dead_letter} block) and remove the reservation, atomically and gated like an ack: when the
+     * reservation is already gone nothing is written. The reservation itself is always identified by its
+     * stored {@link Reservation#body()}.
+     */
+    boolean deadLetter(Reservation reservation, String dlqBody) {
         if (layout == RedisLayout.ZSET) {
             Long done = lua.run(
                 RedisLua.ZSET_DEAD_LETTER,
                 ScriptOutputType.INTEGER,
                 new String[] {keys.reserved(), RedisQueues.dlq(queue)},
                 reservation.handle(),
-                reservation.body());
+                dlqBody);
             return done != null && done == 1;
         }
         Long done = lua.run(
@@ -291,7 +301,7 @@ class RedisQueueOps {
             new String[] {RedisQueues.processing(queue), RedisQueues.deadlines(queue), RedisQueues.dlq(queue)},
             reservation.legacyMember(),
             reservation.body(),
-            reservation.body());
+            dlqBody);
         return gate(done, "dead-letter");
     }
 

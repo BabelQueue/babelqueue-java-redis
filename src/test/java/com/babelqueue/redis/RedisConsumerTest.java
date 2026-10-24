@@ -1,11 +1,14 @@
 package com.babelqueue.redis;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -17,12 +20,15 @@ import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import com.babelqueue.UnknownUrnException;
 import io.lettuce.core.api.sync.RedisCommands;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
 /**
@@ -425,17 +431,80 @@ class RedisConsumerTest {
 
         assertEquals(URN, unknown[0]);
         verify(ops).ack(r);
+        verify(ops, never()).deadLetter(any(), anyString());
     }
 
     @Test
-    void unknownUrnWithoutHandlerReportsOnErrorAndIsNotAcked() {
-        when(ops.reserve()).thenReturn(legacy(envelope(0)));
+    void unknownUrnWithoutHookReportsOnErrorAndIsDeadLetteredWithoutAck() {
+        Reservation r = legacy(envelope(2));
+        when(ops.reserve()).thenReturn(r);
 
         Throwable[] captured = {null};
         builder().onError((err, env, body) -> captured[0] = err).build().poll();
 
         assertInstanceOf(UnknownUrnException.class, captured[0]);
+        ArgumentCaptor<String> record = ArgumentCaptor.forClass(String.class);
+        verify(ops).deadLetter(eq(r), record.capture());
         verify(ops, never()).ack(any());
+        verify(ops, never()).release(any(), anyDouble());
+
+        Envelope dead = EnvelopeCodec.decode(record.getValue());
+        assertEquals(URN, EnvelopeCodec.urn(dead));
+        assertEquals("unknown_urn", dead.deadLetter().reason());
+        assertEquals(QUEUE, dead.deadLetter().originalQueue());
+        assertEquals(2, dead.deadLetter().attempts());
+        assertEquals(7, ((Number) dead.data().get("order_id")).intValue());
+    }
+
+    @Test
+    void zsetUnknownUrnDeadLettersABareAnnotatedRecordWithAttemptsPlusOne() {
+        when(ops.layout()).thenReturn(RedisLayout.ZSET);
+        Reservation r = new Reservation(envelope(2), "reserved-member", false);
+        when(ops.reserve()).thenReturn(r);
+
+        builder().build().poll();
+
+        ArgumentCaptor<String> record = ArgumentCaptor.forClass(String.class);
+        verify(ops).deadLetter(eq(r), record.capture());
+        verify(ops, never()).ack(any());
+        assertFalse(record.getValue().contains("__bq_frame"));
+        Envelope dead = EnvelopeCodec.decode(record.getValue());
+        assertEquals("unknown_urn", dead.deadLetter().reason());
+        assertEquals(3, dead.deadLetter().attempts()); // stored 2 + 1 (the delivery the consumer saw)
+    }
+
+    @Test
+    void legacyUnknownUrnKeepsTheHeaderFrameSoTraceparentSurvives() {
+        String frame = RedisFrame.frame(envelope(0), Map.of("traceparent", "00-aa-bb-01"));
+        Reservation r = legacy(frame);
+        when(ops.reserve()).thenReturn(r);
+
+        builder().build().poll();
+
+        ArgumentCaptor<String> record = ArgumentCaptor.forClass(String.class);
+        verify(ops).deadLetter(eq(r), record.capture());
+        RedisFrame.Unframed unframed = RedisFrame.unframe(record.getValue());
+        assertEquals("00-aa-bb-01", unframed.headers().get("traceparent"));
+        assertEquals("unknown_urn", EnvelopeCodec.decode(unframed.body()).deadLetter().reason());
+    }
+
+    @Test
+    void unknownUrnRecordFallsBackToTheStoredBodyWhenTheRecordCannotBeBuilt() {
+        String stored = envelope(1);
+        Reservation r = legacy(stored);
+        Envelope envelope = EnvelopeCodec.decode(stored);
+        // Framing the legacy record walks the headers; a map that throws makes the build fail.
+        Map<String, String> explodingHeaders = new AbstractMap<>() {
+            @Override
+            public Set<Map.Entry<String, String>> entrySet() {
+                throw new IllegalStateException("boom");
+            }
+        };
+
+        String record = builder().build().unknownUrnRecord(
+            envelope, explodingHeaders, new UnknownUrnException(URN), r, false);
+
+        assertEquals(stored, record);
     }
 
     @Test

@@ -66,6 +66,12 @@ job-structure and no added fields.
 Retry is **at-least-once**: in the default layout a throwing handler leaves the message on the
 `<queue>:processing` list (a recovery sweep can requeue it); a successful handler `LREM`s
 it (the zset layout releases it with a backoff when one is configured, see below). The poll loop never stops on a bad message — observe via `onError` / `onUnknownUrn`.
+
+A message whose URN has **no handler** is not retried: with no `onUnknownUrn` hook it is reported to `onError`
+and **dead-lettered** to `<queue>.dlq` with `dead_letter.reason = "unknown_urn"` (the reservation is removed
+atomically by the same script that writes the DLQ record, in both layouts), so it cannot loop after
+`retry_after`. If you register an `onUnknownUrn` hook, it takes over: the hook runs and the message is acked
+(no DLQ record).
 The envelope is unchanged (`schema_version` stays `1`); Redis is purely additive.
 
 > **Scope.** The default (`RedisLayout.LEGACY`) is a **Java-owned reliable queue**,

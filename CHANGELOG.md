@@ -43,6 +43,18 @@ The envelope wire format is versioned separately by `meta.schema_version`
   now dead-lettered to `<queue>.dlq` (raw body, no `dead_letter` block). Before, it was left in
   `<queue>:processing`; with the new deadline sweep it would have been redelivered forever.
 
+### Fixed
+- **A URN with no handler and no `onUnknownUrn` hook is now dead-lettered instead of redelivered forever.**
+  It used to be reported to `onError` and left reserved, so it came back after `retry_after` (or, in the zset
+  layout, after the reservation expired) and looped. It now gets the `onError` callback (if any) and an
+  annotated record on `<queue>.dlq` (`dead_letter.reason = "unknown_urn"`, `original_queue`, `attempts`, the
+  error and `UnknownUrnException`; the legacy layout keeps the `__bq_frame` header frame so `traceparent`
+  survives). The reservation is removed by the same gated Lua script that writes the DLQ record (no ack),
+  atomically, in both the legacy `:processing` and the zset `:reserved` layouts (.NET Faz 15 parity).
+  With an `onUnknownUrn` hook registered the behaviour is unchanged: the hook runs, then the message is acked
+  with no DLQ record. There is no option to disable the dead-lettering. Covered by unit tests in both layouts
+  and live Redis tests (`RedisUnknownUrnLiveTest`, skipped without Redis, run in CI).
+
 ## [1.1.0] - 2026-06-21
 
 ### Added

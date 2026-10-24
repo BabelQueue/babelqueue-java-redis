@@ -1,6 +1,7 @@
 package com.babelqueue.redis;
 
 import com.babelqueue.BabelQueueException;
+import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import com.babelqueue.UnknownUrnException;
@@ -38,7 +39,9 @@ import java.util.function.LongSupplier;
  * </ul>
  *
  * <p>The poll loop never stops on a bad message &mdash; observe via {@code onError}/{@code onUnknownUrn}.
- * A non-conformant envelope is reported and moved to {@code <queue>.dlq}.
+ * A non-conformant envelope is reported and moved to {@code <queue>.dlq}. A URN with no handler (and no
+ * {@code onUnknownUrn}) is reported and moved to {@code <queue>.dlq} too, annotated
+ * {@code dead_letter.reason = "unknown_urn"}, by the same atomic gated script (no ack).
  *
  * <p>A throwing handler is reported, then:
  * <ul>
@@ -62,13 +65,13 @@ import java.util.function.LongSupplier;
  */
 public final class RedisConsumer {
 
-    /** Notified of a non-conformant envelope, an unmapped URN (no {@code onUnknownUrn}), or a throwing handler. */
+    /** Notified of a non-conformant envelope, an unmapped URN (no {@code onUnknownUrn}; then dead-lettered), or a throwing handler. */
     @FunctionalInterface
     public interface ErrorHandler {
         void onError(Throwable error, Envelope envelope, String body);
     }
 
-    /** Called instead of erroring when a URN has no handler; the message is then acked. */
+    /** Called instead of dead-lettering when a URN has no handler; the message is then acked (no DLQ record). */
     @FunctionalInterface
     public interface UnknownUrnHandler {
         void onUnknownUrn(Envelope envelope, String body);
@@ -236,8 +239,11 @@ public final class RedisConsumer {
                 onUnknownUrn.onUnknownUrn(envelope, body);
                 ops.ack(reservation);
             } else {
-                // Leave the reservation to expire and be recovered.
-                report(new UnknownUrnException(urn), envelope, body);
+                // error-handling.md section 6 / ADR-0009: an unroutable message is dead-lettered (reason
+                // unknown_urn), not left to lapse and be redelivered forever.
+                UnknownUrnException error = new UnknownUrnException(urn);
+                report(error, envelope, body);
+                ops.deadLetter(reservation, unknownUrnRecord(envelope, headers, error, reservation, zset));
             }
             return;
         }
@@ -257,6 +263,30 @@ public final class RedisConsumer {
             return;
         }
         ops.ack(reservation);
+    }
+
+    /**
+     * The DLQ record of an unmapped URN: the envelope plus the additive {@code dead_letter} block
+     * ({@code reason: unknown_urn}, {@code original_queue}, {@code attempts}, {@code lang}). On the legacy
+     * layout the header frame is carried over so a {@code traceparent} survives; the zset layout stays bare
+     * (no frames, A3). If the record cannot be built the stored value is dead-lettered unchanged, so the
+     * message is never lost.
+     */
+    String unknownUrnRecord(
+        Envelope envelope, Map<String, String> headers, UnknownUrnException error, Reservation reservation, boolean zset) {
+        try {
+            Envelope dead = DeadLetters.annotate(
+                envelope,
+                "unknown_urn",
+                queue,
+                envelope.attempts(),
+                error.getMessage(),
+                UnknownUrnException.class.getName());
+            String encoded = EnvelopeCodec.encode(dead);
+            return zset ? encoded : RedisFrame.frame(encoded, headers);
+        } catch (RuntimeException e) {
+            return reservation.body();
+        }
     }
 
     /**

@@ -373,6 +373,32 @@ class RedisQueueOpsTest {
         assertEquals(List.of(r.legacyMember(), "raw", "raw"), call.values());
     }
 
+    @Test
+    void zsetDeadLetterWithACustomBodyRemovesTheReservedMemberAndWritesThatBody() {
+        RecordingRedis rec = new RecordingRedis().script(RedisLua.ZSET_DEAD_LETTER, 1L, 0L);
+        RedisQueueOps ops = zset(rec);
+        Reservation r = new Reservation("original", "member", false);
+        assertTrue(ops.deadLetter(r, "annotated"));
+        assertFalse(ops.deadLetter(r, "annotated"));
+        RecordingRedis.Call call = rec.scriptCalls(RedisLua.ZSET_DEAD_LETTER).get(0);
+        assertArrayEquals(new String[] {"queues:orders:reserved", "orders.dlq"}, call.keys());
+        assertEquals(List.of("member", "annotated"), call.values());
+    }
+
+    @Test
+    void legacyDeadLetterWithACustomBodyRemovesTheOriginalFromProcessingAndWritesThatBody() {
+        RecordingRedis rec = new RecordingRedis().script(RedisLua.LEGACY_MOVE, 1L, 0L);
+        RedisQueueOps ops = legacy(rec);
+        Reservation r = new Reservation("original", "0123456789abcdef0123456789abcdef", false);
+        assertTrue(ops.deadLetter(r, "annotated"));
+        assertFalse(ops.deadLetter(r, "annotated"));
+        RecordingRedis.Call call = rec.scriptCalls(RedisLua.LEGACY_MOVE).get(0);
+        assertArrayEquals(new String[] {"orders:processing", "orders:processing:deadlines", "orders.dlq"},
+            call.keys());
+        // The reservation is still identified by the stored body; only the DLQ payload differs.
+        assertEquals(List.of(r.legacyMember(), "original", "annotated"), call.values());
+    }
+
     // ------------------------------------------------------------------------------- publishing
 
     @Test
