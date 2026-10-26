@@ -6,18 +6,37 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.babelqueue.JsonValues;
+import com.babelqueue.PoisonRecord;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 
-/** ADR-0035 DLQ record shapes written by the local {@link PoisonRecord} writer (Redis poison path). */
+/**
+ * ADR-0035 DLQ record shapes written by core {@link PoisonRecord} (Redis poison path). The core strict-JSON scanner is
+ * package-private, so its edge cases are observed through the public {@code build(byte[], String)}: a body the scanner
+ * accepts is spliced at byte level, one it rejects is carried in the {@code raw} wrapper.
+ */
 class PoisonRecordTest {
 
     private static final String BLOCK = "{\"reason\":\"poison\"}";
 
     private static String build(String body) {
         return PoisonRecord.build(body.getBytes(StandardCharsets.UTF_8), BLOCK);
+    }
+
+    /** What a spliceable object body must become: the trimmed original bytes with the block appended as a member. */
+    private static String expectedSplice(String body) {
+        String trimmed = body.strip();
+        String inner = trimmed.substring(1, trimmed.length() - 1).strip();
+        if (inner.isEmpty()) {
+            return "{\"dead_letter\":" + BLOCK + "}";
+        }
+        return trimmed.substring(0, trimmed.length() - 1) + ",\"dead_letter\":" + BLOCK + "}";
+    }
+
+    private static String expectedWrap(String body) {
+        return "{\"raw\":" + JsonValues.encode(body) + ",\"dead_letter\":" + BLOCK + "}";
     }
 
     @Test
@@ -65,7 +84,7 @@ class PoisonRecordTest {
             "{\"a\":" + "[".repeat(100) + "]".repeat(100) + "}",
         };
         for (String body : valid) {
-            assertTrue(PoisonRecord.isSpliceableObject(body), body);
+            assertEquals(expectedSplice(body), build(body), body);
         }
     }
 
@@ -83,7 +102,7 @@ class PoisonRecordTest {
             "{\"dead_letter\":1}", "{\"x\":1,\"dead_letter\":{}}", "{\"dead\\u005fletter\":1}",
         };
         for (String body : invalid) {
-            assertFalse(PoisonRecord.isSpliceableObject(body), body);
+            assertEquals(expectedWrap(body), build(body), body);
         }
     }
 }
