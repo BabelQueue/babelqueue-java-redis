@@ -17,7 +17,7 @@ pattern.
 <dependency>
   <groupId>com.babelqueue</groupId>
   <artifactId>babelqueue-redis</artifactId>
-  <version>1.2.0</version>
+  <version>1.2.1</version>
 </dependency>
 ```
 
@@ -166,7 +166,7 @@ A header-less `publish(...)` stores the bare envelope **byte-for-byte**; a bare
 (un-framed) value still consumes — the consumer detects a frame by the reserved
 `__bq_frame` sentinel (a frozen envelope never carries it), and the `LREM` ack handle
 stays the stored value, so cross-version queues interoperate. The existing
-`(env, body)` handler keeps working. Requires `babelqueue-core` ≥ 1.5.0 (this release builds on 1.13.0); no new runtime
+`(env, body)` handler keeps working. Requires `babelqueue-core` ≥ 1.5.0 (this release builds on 1.14.0); no new runtime
 dependency (the frame codec is self-contained, the seam is a plain `Map<String,String>`).
 
 ## Build & test
