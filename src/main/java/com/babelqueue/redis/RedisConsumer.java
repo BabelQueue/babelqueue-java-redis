@@ -4,7 +4,7 @@ import com.babelqueue.BabelQueueException;
 import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
-import com.babelqueue.JsonValues;
+import com.babelqueue.PoisonRecord;
 import com.babelqueue.UnknownUrnException;
 import io.lettuce.core.RedisCommandInterruptedException;
 import io.lettuce.core.api.sync.RedisCommands;
@@ -302,17 +302,10 @@ public final class RedisConsumer {
      */
     String poisonRecord(Reservation reservation, String body) {
         try {
-            Map<String, Object> block = new java.util.LinkedHashMap<>();
-            block.put("reason", "poison");
-            block.put("error", "Redis value is not a conformant BabelQueue envelope.");
-            block.put("exception", BabelQueueException.class.getName());
-            block.put("failed_at", System.currentTimeMillis());
-            block.put("original_queue", queue);
-            block.put("attempts", 0);
-            block.put("lang", EnvelopeCodec.SOURCE_LANG);
             // Exact stored bytes when they are not valid UTF-8 (the text view is lossy), else the (unframed) body.
             byte[] raw = reservation.hasInvalidUtf8() ? reservation.bodyBytes() : body.getBytes(StandardCharsets.UTF_8);
-            return PoisonRecord.build(raw, JsonValues.encode(block));
+            return PoisonRecord.build(raw, queue, 0, "Redis value is not a conformant BabelQueue envelope.",
+                BabelQueueException.class.getName());
         } catch (RuntimeException e) {
             if (reservation.hasInvalidUtf8()) {
                 throw e; // the text view is lossy: leave the reservation to be recovered rather than rewrite its bytes

@@ -49,7 +49,7 @@
         <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-        <babelqueue-core.version>1.13.0</babelqueue-core.version>
+        <babelqueue-core.version>1.14.0</babelqueue-core.version>
         <lettuce.version>6.5.5.RELEASE</lettuce.version>
         <opentelemetry.version>1.45.0</opentelemetry.version>
         <junit.version>5.10.3</junit.version>
