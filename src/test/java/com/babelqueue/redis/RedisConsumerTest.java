@@ -894,4 +894,26 @@ class RedisConsumerTest {
     private static <T extends Throwable> void sneakyThrow(Throwable t) throws T {
         throw (T) t;
     }
+
+    @Test
+    void eventQueueFallbackTreatsOnlyTheAsciiWhitespaceSetAsBlank() {
+        String json = EnvelopeCodec.encode(EnvelopeCodec.make(URN, Map.of("order_id", 7), "billing", null));
+        // meta.queue as JSON text -> the queue the event must report. Only the ASCII whitespace set is blank (ADR-0031):
+        // Unicode spaces and control characters (Character.isWhitespace) are real, non-blank names.
+        String[][] cases = {
+            {" \\t", QUEUE}, {"", QUEUE}, {"\\u000b\\f\\r", QUEUE},
+            {"\\u2003", "\u2003"}, {"\\u00a0", "\u00a0"}, {"\\u001c", "\u001c"}, {"\\u0085", "\u0085"},
+        };
+        for (String[] c : cases) {
+            Reservation unknown = legacy(json.replace("\"queue\":\"billing\"", "\"queue\":\"" + c[0] + "\""));
+            when(ops.reserve()).thenReturn(unknown);
+            when(ops.deadLetter(eq(unknown), anyString())).thenReturn(true);
+            List<DeadLetterEvent> events = new ArrayList<>();
+
+            builder().deadLetterObserver(events::add).build().poll();
+
+            assertEquals(1, events.size(), c[0]);
+            assertEquals(c[1], events.get(0).queue(), "meta.queue=" + c[0]);
+        }
+    }
 }

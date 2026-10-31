@@ -293,7 +293,7 @@ public final class RedisConsumer {
      */
     private String sourceQueue(Envelope envelope) {
         if (envelope != null && envelope.meta() != null
-            && envelope.meta().queue() != null && !envelope.meta().queue().isBlank()) {
+            && !EnvelopeCodec.isBlankAscii(envelope.meta().queue())) {
             return envelope.meta().queue();
         }
         return queue;
