@@ -159,8 +159,8 @@ class RedisTraceparentTest {
             .poll();
 
         List<SpanData> spans = exporter.getFinishedSpanItems();
-        SpanData producer = spanByName(spans, "publish urn:babel:orders:created");
-        SpanData consumer = spanByName(spans, "process urn:babel:orders:created");
+        SpanData producer = spanByName(spans, "send orders");
+        SpanData consumer = spanByName(spans, "process orders");
         assertEquals(producer.getSpanContext().getSpanId(), consumer.getParentSpanContext().getSpanId());
         assertEquals(producer.getSpanContext().getTraceId(), consumer.getTraceId());
         assertTrue(consumer.getParentSpanContext().isRemote());

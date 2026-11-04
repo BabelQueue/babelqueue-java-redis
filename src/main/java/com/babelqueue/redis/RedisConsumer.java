@@ -1,6 +1,8 @@
 package com.babelqueue.redis;
 
 import com.babelqueue.BabelQueueException;
+import com.babelqueue.DeadLetterEvent;
+import com.babelqueue.DeadLetterObserver;
 import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
@@ -122,6 +124,7 @@ public final class RedisConsumer {
     private final IntToDoubleFunction retryDelay;
     private final ErrorHandler onError;
     private final UnknownUrnHandler onUnknownUrn;
+    private final DeadLetterObserver deadLetterObserver;
     private final LongSupplier nanoClock;
     private final LongConsumer sleeper;
     private long backoffMs = BACKOFF_START_MS;
@@ -144,6 +147,7 @@ public final class RedisConsumer {
         this.retryDelay = builder.resolveRetryDelay();
         this.onError = builder.onError;
         this.onUnknownUrn = builder.onUnknownUrn;
+        this.deadLetterObserver = builder.deadLetterObserver;
         this.nanoClock = builder.nanoClock;
         this.sleeper = builder.sleeper;
     }
@@ -221,13 +225,13 @@ public final class RedisConsumer {
         if (reservation.poison() || reservation.hasInvalidUtf8()) {
             report(new BabelQueueException("Dead-lettered a Redis job the reserve script could not decode."),
                 envelope, body);
-            ops.deadLetter(reservation, poisonRecord(reservation, body));
+            deadLetter(reservation, poisonRecord(reservation, body), "poison", queue);
             return;
         }
         if (!EnvelopeCodec.accepts(envelope)) {
             report(new BabelQueueException("Rejected a non-conformant BabelQueue envelope from Redis."),
                 envelope, body);
-            ops.deadLetter(reservation, poisonRecord(reservation, body));
+            deadLetter(reservation, poisonRecord(reservation, body), "poison", queue);
             return;
         }
         if (zset) {
@@ -246,7 +250,8 @@ public final class RedisConsumer {
                 // unknown_urn), not left to lapse and be redelivered forever.
                 UnknownUrnException error = new UnknownUrnException(urn);
                 report(error, envelope, body);
-                ops.deadLetter(reservation, unknownUrnRecord(envelope, headers, error, reservation, zset));
+                deadLetter(reservation, unknownUrnRecord(envelope, headers, error, reservation, zset), "unknown_urn",
+                    sourceQueue(envelope));
             }
             return;
         }
@@ -266,6 +271,32 @@ public final class RedisConsumer {
             return;
         }
         ops.ack(reservation);
+    }
+
+    /**
+     * Moves the reservation to {@code <queue>.dlq} and, only when {@link RedisQueueOps#deadLetter} confirms the
+     * write, calls the optional {@link DeadLetterObserver} exactly once (ADR-0039 section 5.1). A {@code false}
+     * result (the reservation was swept or already settled, nothing was written) calls nothing. The observer is
+     * isolated through {@link DeadLetterObserver#notifySafely}: it never changes the DLQ result or the reservation.
+     */
+    private void deadLetter(Reservation reservation, String record, String reason, String eventQueue) {
+        if (ops.deadLetter(reservation, record) && deadLetterObserver != null) {
+            DeadLetterObserver.notifySafely(deadLetterObserver,
+                new DeadLetterEvent(eventQueue, RedisQueues.dlq(queue), reason));
+        }
+    }
+
+    /**
+     * The source queue of a dead-letter event for a decoded, accepted envelope: its {@code meta.queue}, else this
+     * consumer's queue (ADR-0039 section 5.1). A poison value has no accepted envelope and reports the consumer's
+     * queue.
+     */
+    private String sourceQueue(Envelope envelope) {
+        if (envelope != null && envelope.meta() != null
+            && !EnvelopeCodec.isBlankAscii(envelope.meta().queue())) {
+            return envelope.meta().queue();
+        }
+        return queue;
     }
 
     /**
@@ -376,6 +407,7 @@ public final class RedisConsumer {
         private DoubleSupplier random = () -> java.util.concurrent.ThreadLocalRandom.current().nextDouble();
         private ErrorHandler onError;
         private UnknownUrnHandler onUnknownUrn;
+        private DeadLetterObserver deadLetterObserver;
         private RedisQueueOps ops;
         private DoubleSupplier clock = () -> System.currentTimeMillis() / 1000.0;
         private LongSupplier nanoClock = System::nanoTime;
@@ -571,6 +603,24 @@ public final class RedisConsumer {
 
         public Builder onUnknownUrn(UnknownUrnHandler handler) {
             this.onUnknownUrn = handler;
+            return this;
+        }
+
+        /**
+         * Optional observer of the dead-letters this consumer itself writes (ADR-0039 section 5.1): called exactly
+         * once per record moved to {@code <queue>.dlq} (a poison value, an unknown URN), after the atomic move is
+         * confirmed. The event carries the source queue (the envelope's {@code meta.queue}
+         * for an unknown URN, else this consumer's queue name; a poison value always reports the consumer's queue),
+         * {@code <queue>.dlq} and the {@code dead_letter.reason} ({@code poison} or {@code unknown_urn}).
+         *
+         * <p>It is <b>not</b> called when the move did not happen (the reservation was already swept or settled), for
+         * a handler failure (the reservation is released or left to expire, never dead-lettered by this consumer), or
+         * when an {@link #onUnknownUrn} hook acks the message instead. Anything the observer throws is logged and
+         * swallowed; the ack, release and DLQ outcome never change. Unset (the default): behaviour is unchanged.
+         * {@code com.babelqueue.otel.Metrics#deadLetterObserver} increments {@code babelqueue.dlq.messages}.
+         */
+        public Builder deadLetterObserver(DeadLetterObserver observer) {
+            this.deadLetterObserver = observer;
             return this;
         }
 

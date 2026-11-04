@@ -9,6 +9,21 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-03
+
+### Added
+
+- `RedisConsumer.Builder.deadLetterObserver(DeadLetterObserver)` (ADR-0039 section 5.1, opt-in): the observer is
+  called exactly once for every record this consumer moves to `<queue>.dlq` - a poison value (`poison`) and an unknown
+  URN without an `onUnknownUrn` hook (`unknown_urn`), on both layouts - after the atomic move is confirmed. The event
+  carries the source queue (the envelope's `meta.queue` for an unknown URN, else the consumer's queue name; a poison
+  value always reports the consumer's queue), `<queue>.dlq` and the `dead_letter.reason`. It is not called when the move wrote
+  nothing (the reservation was already swept or settled), for a handler failure (released or left to expire, never
+  dead-lettered by this consumer), or when an `onUnknownUrn` hook acks the message. An observer that throws is logged
+  and swallowed; the ack, release and DLQ outcome are unchanged. Unset (the default) behaviour is byte-for-byte
+  unchanged. Wire format unchanged.
+- Requires a `babelqueue-core` that carries `DeadLetterObserver` / `DeadLetterEvent` (core 1.15.0, the version this release pins).
+
 ## [1.2.1] - 2026-10-26
 
 ### Changed

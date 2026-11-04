@@ -17,6 +17,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.babelqueue.BabelQueueException;
+import com.babelqueue.DeadLetterEvent;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import com.babelqueue.JsonValues;
@@ -715,5 +716,204 @@ class RedisConsumerTest {
         assertThrows(IllegalArgumentException.class, () -> builder().failureDelaySeconds(-1));
         assertThrows(IllegalArgumentException.class, () -> builder().failureDelaySeconds(Double.NaN));
         assertThrows(IllegalArgumentException.class, () -> builder().failureDelaySeconds(Double.POSITIVE_INFINITY));
+    }
+
+    // ---- dead-letter observer (ADR-0039 section 5.1) -----------------------------------------
+
+    @Test
+    void observerIsCalledOnceForAPoisonValueAfterTheMoveIsConfirmed() {
+        Reservation r = legacy("{\"not\":\"an envelope\"}");
+        when(ops.reserve()).thenReturn(r);
+        when(ops.deadLetter(eq(r), anyString())).thenReturn(true);
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        builder().deadLetterObserver(events::add).build().poll();
+
+        assertEquals(List.of(new DeadLetterEvent(QUEUE, "orders.dlq", "poison")), events);
+        verify(ops, times(1)).deadLetter(eq(r), anyString());
+    }
+
+    @Test
+    void observerIsCalledOnceForAPoisonReservationOnTheZsetLayout() {
+        when(ops.layout()).thenReturn(RedisLayout.ZSET);
+        Reservation r = new Reservation("not json", "not json", true);
+        when(ops.reserve()).thenReturn(r);
+        when(ops.deadLetter(eq(r), anyString())).thenReturn(true);
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        builder().deadLetterObserver(events::add).build().poll();
+
+        assertEquals(List.of(new DeadLetterEvent(QUEUE, "orders.dlq", "poison")), events);
+    }
+
+    @Test
+    void observerIsCalledOnceForAnUnknownUrnWithoutAHook() {
+        Reservation r = legacy(envelope(2));
+        when(ops.reserve()).thenReturn(r);
+        when(ops.deadLetter(eq(r), anyString())).thenReturn(true);
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        builder().deadLetterObserver(events::add).build().poll();
+
+        assertEquals(List.of(new DeadLetterEvent(QUEUE, "orders.dlq", "unknown_urn")), events);
+        verify(ops, never()).ack(any());
+    }
+
+    @Test
+    void unknownUrnEventReportsMetaQueueWhilePoisonReportsTheConsumerQueue() {
+        Reservation unknown = legacy(EnvelopeCodec.encode(
+            EnvelopeCodec.make(URN, Map.of("order_id", 7), "billing", null)));
+        when(ops.reserve()).thenReturn(unknown);
+        when(ops.deadLetter(eq(unknown), anyString())).thenReturn(true);
+        List<DeadLetterEvent> events = new ArrayList<>();
+        builder().deadLetterObserver(events::add).build().poll();
+        assertEquals(List.of(new DeadLetterEvent("billing", "orders.dlq", "unknown_urn")), events);
+
+        events.clear();
+        Reservation poison = legacy("{\"meta\":{\"queue\":\"billing\"}}");
+        when(ops.reserve()).thenReturn(poison);
+        when(ops.deadLetter(eq(poison), anyString())).thenReturn(true);
+        builder().deadLetterObserver(events::add).build().poll();
+        assertEquals(List.of(new DeadLetterEvent(QUEUE, "orders.dlq", "poison")), events);
+    }
+
+    @Test
+    void observerSeesTheMoveAfterItIsConfirmedNotBefore() {
+        Reservation r = legacy(envelope(0));
+        when(ops.reserve()).thenReturn(r);
+        List<String> order = new ArrayList<>();
+        when(ops.deadLetter(eq(r), anyString())).thenAnswer(invocation -> {
+            order.add("move");
+            return true;
+        });
+
+        builder().deadLetterObserver(e -> order.add("observer")).build().poll();
+
+        assertEquals(List.of("move", "observer"), order);
+    }
+
+    @Test
+    void observerIsNotCalledWhenTheMoveWroteNothing() {
+        // RedisQueueOps#deadLetter returns false when the reservation was already swept or settled.
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        Reservation poison = legacy("{}");
+        when(ops.reserve()).thenReturn(poison);
+        when(ops.deadLetter(eq(poison), anyString())).thenReturn(false);
+        builder().deadLetterObserver(events::add).build().poll();
+
+        Reservation unknown = legacy(envelope(0));
+        when(ops.reserve()).thenReturn(unknown);
+        when(ops.deadLetter(eq(unknown), anyString())).thenReturn(false);
+        builder().deadLetterObserver(events::add).build().poll();
+
+        assertTrue(events.isEmpty());
+        verify(ops, times(1)).deadLetter(eq(poison), anyString());
+        verify(ops, times(1)).deadLetter(eq(unknown), anyString());
+    }
+
+    @Test
+    void observerIsNotCalledWhenAnUnknownUrnHookAcksTheMessage() {
+        Reservation r = legacy(envelope(0));
+        when(ops.reserve()).thenReturn(r);
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        builder().onUnknownUrn((env, raw) -> { }).deadLetterObserver(events::add).build().poll();
+
+        assertTrue(events.isEmpty());
+        verify(ops).ack(r);
+    }
+
+    @Test
+    void observerIsNotCalledOnTheReleasePathOrAHandlerFailure() {
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        // zset: a throwing handler is released to :delayed.
+        when(ops.layout()).thenReturn(RedisLayout.ZSET);
+        Reservation z = legacy(envelope(0));
+        when(ops.reserve()).thenReturn(z);
+        builder().handler(URN, (e, b) -> { throw new IllegalStateException("boom"); })
+            .failureDelaySeconds(5.0).deadLetterObserver(events::add).build().poll();
+        verify(ops).release(eq(z), anyDouble());
+
+        // legacy: a throwing handler leaves the reservation to expire.
+        when(ops.layout()).thenReturn(RedisLayout.LEGACY);
+        Reservation l = legacy(envelope(0));
+        when(ops.reserve()).thenReturn(l);
+        builder().handler(URN, (e, b) -> { throw new IllegalStateException("boom"); })
+            .deadLetterObserver(events::add).build().poll();
+
+        // a successful handler is just acked.
+        Reservation ok = legacy(envelope(0));
+        when(ops.reserve()).thenReturn(ok);
+        builder().handler(URN, (e, b) -> { }).deadLetterObserver(events::add).build().poll();
+        verify(ops).ack(ok);
+
+        assertTrue(events.isEmpty());
+        verify(ops, never()).deadLetter(any(), anyString());
+    }
+
+    @Test
+    void aThrowingObserverNeverChangesTheDlqResult() {
+        for (Throwable failure : new Throwable[] {new IllegalStateException("obs"), new AssertionError("obs")}) {
+            Mockito.clearInvocations(ops); // Reservation has value equality: the two rounds would otherwise add up
+            Reservation poison = legacy("{}");
+            when(ops.reserve()).thenReturn(poison);
+            when(ops.deadLetter(eq(poison), anyString())).thenReturn(true);
+            List<Throwable> errors = new ArrayList<>();
+            int polled = builder().onError((err, env, body) -> errors.add(err))
+                .deadLetterObserver(e -> sneakyThrow(failure)).build().poll();
+            assertEquals(1, polled);
+            verify(ops, times(1)).deadLetter(eq(poison), anyString());
+            verify(ops, never()).ack(poison);
+            verify(ops, never()).release(eq(poison), anyDouble());
+            assertEquals(1, errors.size());
+
+            Reservation unknown = legacy(envelope(0));
+            when(ops.reserve()).thenReturn(unknown);
+            when(ops.deadLetter(eq(unknown), anyString())).thenReturn(true);
+            builder().deadLetterObserver(e -> sneakyThrow(failure)).build().poll();
+            verify(ops, times(1)).deadLetter(eq(unknown), anyString());
+            verify(ops, never()).ack(unknown);
+            verify(ops, never()).release(eq(unknown), anyDouble());
+        }
+    }
+
+    @Test
+    void withoutAnObserverTheDlqPathIsUnchanged() {
+        Reservation r = legacy("{}");
+        when(ops.reserve()).thenReturn(r);
+        when(ops.deadLetter(eq(r), anyString())).thenReturn(true);
+
+        assertEquals(1, builder().deadLetterObserver(null).build().poll());
+
+        verify(ops, times(1)).deadLetter(eq(r), anyString());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T extends Throwable> void sneakyThrow(Throwable t) throws T {
+        throw (T) t;
+    }
+
+    @Test
+    void eventQueueFallbackTreatsOnlyTheAsciiWhitespaceSetAsBlank() {
+        String json = EnvelopeCodec.encode(EnvelopeCodec.make(URN, Map.of("order_id", 7), "billing", null));
+        // meta.queue as JSON text -> the queue the event must report. Only the ASCII whitespace set is blank (ADR-0031):
+        // Unicode spaces and control characters (Character.isWhitespace) are real, non-blank names.
+        String[][] cases = {
+            {" \\t", QUEUE}, {"", QUEUE}, {"\\u000b\\f\\r", QUEUE},
+            {"\\u2003", "\u2003"}, {"\\u00a0", "\u00a0"}, {"\\u001c", "\u001c"}, {"\\u0085", "\u0085"},
+        };
+        for (String[] c : cases) {
+            Reservation unknown = legacy(json.replace("\"queue\":\"billing\"", "\"queue\":\"" + c[0] + "\""));
+            when(ops.reserve()).thenReturn(unknown);
+            when(ops.deadLetter(eq(unknown), anyString())).thenReturn(true);
+            List<DeadLetterEvent> events = new ArrayList<>();
+
+            builder().deadLetterObserver(events::add).build().poll();
+
+            assertEquals(1, events.size(), c[0]);
+            assertEquals(c[1], events.get(0).queue(), "meta.queue=" + c[0]);
+        }
     }
 }
